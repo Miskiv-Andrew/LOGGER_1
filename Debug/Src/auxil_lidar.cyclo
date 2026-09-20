@@ -1,0 +1,3 @@
+../Src/auxil_lidar.c:7:9:LiDAR_CalculateChecksum	2
+../Src/auxil_lidar.c:23:9:LiDAR_ValidateFrame	4
+../Src/auxil_lidar.c:38:6:ProcessLidar	2

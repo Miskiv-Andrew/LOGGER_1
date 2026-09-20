@@ -1,0 +1,15 @@
+../Src/main.c:125:6:HAL_UARTEx_RxEventCallback	13
+../Src/main.c:228:6:write_log	1
+../Src/main.c:235:5:init_filesystem	3
+../Src/main.c:263:5:main	8
+../Src/main.c:396:6:SystemClock_Config	4
+../Src/main.c:446:13:MX_ADC1_Init	4
+../Src/main.c:513:13:MX_LPUART1_UART_Init	5
+../Src/main.c:561:13:MX_UART4_Init	5
+../Src/main.c:609:13:MX_USART2_UART_Init	5
+../Src/main.c:657:13:MX_USART3_UART_Init	5
+../Src/main.c:705:13:MX_RTC_Init	4
+../Src/main.c:770:13:MX_SPI1_Init	2
+../Src/main.c:808:13:MX_DMA_Init	1
+../Src/main.c:839:13:MX_GPIO_Init	1
+../Src/main.c:901:6:Error_Handler	1
