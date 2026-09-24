@@ -1,0 +1,715 @@
+diff --git a/Inc/stm32l4xx_hal_conf.h b/Inc/stm32l4xx_hal_conf.h
+index 4183905..fca6f60 100644
+--- a/Inc/stm32l4xx_hal_conf.h
++++ b/Inc/stm32l4xx_hal_conf.h
+@@ -77,7 +77,7 @@
+ #define HAL_SPI_MODULE_ENABLED
+ /*#define HAL_SRAM_MODULE_ENABLED   */
+ /*#define HAL_SWPMI_MODULE_ENABLED   */
+-/*#define HAL_TIM_MODULE_ENABLED   */
++#define HAL_TIM_MODULE_ENABLED
+ /*#define HAL_TSC_MODULE_ENABLED   */
+ #define HAL_UART_MODULE_ENABLED
+ /*#define HAL_USART_MODULE_ENABLED   */
+diff --git a/Inc/stm32l4xx_it.h b/Inc/stm32l4xx_it.h
+index 3708536..e749357 100644
+--- a/Inc/stm32l4xx_it.h
++++ b/Inc/stm32l4xx_it.h
+@@ -58,6 +58,7 @@ void SysTick_Handler(void);
+ void USART2_IRQHandler(void);
+ void USART3_IRQHandler(void);
+ void UART4_IRQHandler(void);
++void TIM6_DAC_IRQHandler(void);
+ void DMA2_Channel1_IRQHandler(void);
+ void DMA2_Channel2_IRQHandler(void);
+ void DMA2_Channel3_IRQHandler(void);
+diff --git a/MDK-ARM/hub3.uvprojx b/MDK-ARM/hub3.uvprojx
+index 8d930cc..6cae33b 100644
+--- a/MDK-ARM/hub3.uvprojx
++++ b/MDK-ARM/hub3.uvprojx
+@@ -1,10 +1,7 @@
+-<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+-<Project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="project_projx.xsd">
+-
++<?xml version="1.0" encoding="UTF-8"?>
++<Project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" noNamespaceSchemaLocation="project_projx.xsd">
+   <SchemaVersion>2.1</SchemaVersion>
+-
+   <Header>### uVision Project, (C) Keil Software</Header>
+-
+   <Targets>
+     <Target>
+       <TargetName>hub3</TargetName>
+@@ -19,28 +16,28 @@
+           <PackID>Keil.STM32L4xx_DFP.3.1.0</PackID>
+           <PackURL>https://www.keil.com/pack/</PackURL>
+           <Cpu>IRAM(0x20000000-0x2004FFFF) IROM(0x8000000-0x807FFFF) CLOCK(8000000) FPU2 CPUTYPE("Cortex-M4") TZ</Cpu>
+-          <FlashUtilSpec></FlashUtilSpec>
+-          <StartupFile></StartupFile>
+-          <FlashDriverDll></FlashDriverDll>
++          <FlashUtilSpec />
++          <StartupFile />
++          <FlashDriverDll />
+           <DeviceId>0</DeviceId>
+-          <RegisterFile></RegisterFile>
+-          <MemoryEnv></MemoryEnv>
+-          <Cmp></Cmp>
+-          <Asm></Asm>
+-          <Linker></Linker>
+-          <OHString></OHString>
+-          <InfinionOptionDll></InfinionOptionDll>
+-          <SLE66CMisc></SLE66CMisc>
+-          <SLE66AMisc></SLE66AMisc>
+-          <SLE66LinkerMisc></SLE66LinkerMisc>
++          <RegisterFile />
++          <MemoryEnv />
++          <Cmp />
++          <Asm />
++          <Linker />
++          <OHString />
++          <InfinionOptionDll />
++          <SLE66CMisc />
++          <SLE66AMisc />
++          <SLE66LinkerMisc />
+           <SFDFile>$$Device:STM32L4P5RETx$CMSIS\SVD\STM32L4P5.svd</SFDFile>
+           <bCustSvd>0</bCustSvd>
+           <UseEnv>0</UseEnv>
+-          <BinPath></BinPath>
+-          <IncludePath></IncludePath>
+-          <LibPath></LibPath>
+-          <RegisterFilePath></RegisterFilePath>
+-          <DBRegisterFilePath></DBRegisterFilePath>
++          <BinPath />
++          <IncludePath />
++          <LibPath />
++          <RegisterFilePath />
++          <DBRegisterFilePath />
+           <TargetStatus>
+             <Error>0</Error>
+             <ExitCodeStop>0</ExitCodeStop>
+@@ -55,15 +52,15 @@
+           <CreateHexFile>1</CreateHexFile>
+           <DebugInformation>1</DebugInformation>
+           <BrowseInformation>1</BrowseInformation>
+-          <ListingPath></ListingPath>
++          <ListingPath />
+           <HexFormatSelection>1</HexFormatSelection>
+           <Merge32K>0</Merge32K>
+           <CreateBatchFile>0</CreateBatchFile>
+           <BeforeCompile>
+             <RunUserProg1>0</RunUserProg1>
+             <RunUserProg2>0</RunUserProg2>
+-            <UserProg1Name></UserProg1Name>
+-            <UserProg2Name></UserProg2Name>
++            <UserProg1Name />
++            <UserProg2Name />
+             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
+             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
+             <nStopU1X>0</nStopU1X>
+@@ -72,8 +69,8 @@
+           <BeforeMake>
+             <RunUserProg1>0</RunUserProg1>
+             <RunUserProg2>0</RunUserProg2>
+-            <UserProg1Name></UserProg1Name>
+-            <UserProg2Name></UserProg2Name>
++            <UserProg1Name />
++            <UserProg2Name />
+             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
+             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
+             <nStopB1X>0</nStopB1X>
+@@ -82,15 +79,15 @@
+           <AfterMake>
+             <RunUserProg1>0</RunUserProg1>
+             <RunUserProg2>1</RunUserProg2>
+-            <UserProg1Name></UserProg1Name>
+-            <UserProg2Name></UserProg2Name>
++            <UserProg1Name />
++            <UserProg2Name />
+             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
+             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
+             <nStopA1X>0</nStopA1X>
+             <nStopA2X>0</nStopA2X>
+           </AfterMake>
+           <SelectedForBatchBuild>1</SelectedForBatchBuild>
+-          <SVCSIdString></SVCSIdString>
++          <SVCSIdString />
+         </TargetCommonOption>
+         <CommonProperty>
+           <UseCPPCompiler>0</UseCPPCompiler>
+@@ -104,8 +101,8 @@
+           <AssembleAssemblyFile>0</AssembleAssemblyFile>
+           <PublicsOnly>0</PublicsOnly>
+           <StopOnExitCode>3</StopOnExitCode>
+-          <CustomArgument></CustomArgument>
+-          <IncludeLibraryModules></IncludeLibraryModules>
++          <CustomArgument />
++          <IncludeLibraryModules />
+           <ComprImg>0</ComprImg>
+         </CommonProperty>
+         <DllOption>
+@@ -138,11 +135,11 @@
+           </Flash1>
+           <bUseTDR>1</bUseTDR>
+           <Flash2>BIN\UL2V8M.DLL</Flash2>
+-          <Flash3></Flash3>
+-          <Flash4></Flash4>
+-          <pFcarmOut></pFcarmOut>
+-          <pFcarmGrp></pFcarmGrp>
+-          <pFcArmRoot></pFcArmRoot>
++          <Flash3 />
++          <Flash4 />
++          <pFcarmOut />
++          <pFcarmGrp />
++          <pFcArmRoot />
+           <FcArmLst>0</FcArmLst>
+         </Utilities>
+         <TargetArmAds>
+@@ -175,7 +172,7 @@
+             <RvctClst>0</RvctClst>
+             <GenPPlst>0</GenPPlst>
+             <AdsCpuType>"Cortex-M4"</AdsCpuType>
+-            <RvctDeviceName></RvctDeviceName>
++            <RvctDeviceName />
+             <mOS>0</mOS>
+             <uocRom>0</uocRom>
+             <uocRam>0</uocRam>
+@@ -310,7 +307,7 @@
+                 <Size>0x0</Size>
+               </OCR_RVCT10>
+             </OnChipMemories>
+-            <RvctStartVector></RvctStartVector>
++            <RvctStartVector />
+           </ArmAdsMisc>
+           <Cads>
+             <interw>1</interw>
+@@ -337,9 +334,9 @@
+             <v6WtE>0</v6WtE>
+             <v6Rtti>0</v6Rtti>
+             <VariousControls>
+-              <MiscControls></MiscControls>
++              <MiscControls />
+               <Define>USE_HAL_DRIVER,STM32L4P5xx</Define>
+-              <Undefine></Undefine>
++              <Undefine />
+               <IncludePath>../Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FatFs/src;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include</IncludePath>
+             </VariousControls>
+           </Cads>
+@@ -355,10 +352,10 @@
+             <useXO>0</useXO>
+             <ClangAsOpt>1</ClangAsOpt>
+             <VariousControls>
+-              <MiscControls></MiscControls>
+-              <Define></Define>
+-              <Undefine></Undefine>
+-              <IncludePath></IncludePath>
++              <MiscControls />
++              <Define />
++              <Undefine />
++              <IncludePath />
+             </VariousControls>
+           </Aads>
+           <LDads>
+@@ -368,15 +365,15 @@
+             <noStLib>0</noStLib>
+             <RepFail>1</RepFail>
+             <useFile>0</useFile>
+-            <TextAddressRange></TextAddressRange>
+-            <DataAddressRange></DataAddressRange>
+-            <pXoBase></pXoBase>
+-            <ScatterFile></ScatterFile>
+-            <IncludeLibs></IncludeLibs>
+-            <IncludeLibsPath></IncludeLibsPath>
+-            <Misc></Misc>
+-            <LinkerInputFile></LinkerInputFile>
+-            <DisabledWarnings></DisabledWarnings>
++            <TextAddressRange />
++            <DataAddressRange />
++            <pXoBase />
++            <ScatterFile />
++            <IncludeLibs />
++            <IncludeLibsPath />
++            <Misc />
++            <LinkerInputFile />
++            <DisabledWarnings />
+           </LDads>
+         </TargetArmAds>
+       </TargetOption>
+@@ -399,6 +396,21 @@
+               <FileType>1</FileType>
+               <FilePath>..\Src\user_diskio_spi.c</FilePath>
+             </File>
++            <File>
++              <FileName>logger_types.h</FileName>
++              <FileType>5</FileType>
++              <FilePath>..\Inc\logger_types.h</FilePath>
++            </File>
++            <File>
++              <FileName>logger_state_machine.h</FileName>
++              <FileType>5</FileType>
++              <FilePath>..\Inc\logger_state_machine.h</FilePath>
++            </File>
++            <File>
++              <FileName>logger_state_machine.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>..\Src\logger_state_machine.c</FilePath>
++            </File>
+             <File>
+               <FileName>main.c</FileName>
+               <FileType>1</FileType>
+@@ -424,21 +436,6 @@
+               <FileType>1</FileType>
+               <FilePath>../Src/stm32l4xx_hal_msp.c</FilePath>
+             </File>
+-            <File>
+-              <FileName>logger_types.h</FileName>
+-              <FileType>5</FileType>
+-              <FilePath>..\Inc\logger_types.h</FilePath>
+-            </File>
+-            <File>
+-              <FileName>logger_state_machine.h</FileName>
+-              <FileType>5</FileType>
+-              <FilePath>..\Inc\logger_state_machine.h</FilePath>
+-            </File>
+-            <File>
+-              <FileName>logger_state_machine.c</FileName>
+-              <FileType>1</FileType>
+-              <FilePath>..\Src\logger_state_machine.c</FilePath>
+-            </File>
+           </Files>
+         </Group>
+         <Group>
+@@ -559,6 +556,126 @@
+               <FileType>1</FileType>
+               <FilePath>../Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_spi_ex.c</FilePath>
+             </File>
++            <File>
++              <FileName>stm32l4xx_hal_tim.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>../Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_tim.c</FilePath>
++              <FileOption>
++                <CommonProperty>
++                  <UseCPPCompiler>2</UseCPPCompiler>
++                  <RVCTCodeConst>0</RVCTCodeConst>
++                  <RVCTZI>0</RVCTZI>
++                  <RVCTOtherData>0</RVCTOtherData>
++                  <ModuleSelection>0</ModuleSelection>
++                  <IncludeInBuild>1</IncludeInBuild>
++                  <AlwaysBuild>2</AlwaysBuild>
++                  <GenerateAssemblyFile>2</GenerateAssemblyFile>
++                  <AssembleAssemblyFile>2</AssembleAssemblyFile>
++                  <PublicsOnly>2</PublicsOnly>
++                  <StopOnExitCode>11</StopOnExitCode>
++                  <ComprImg>1</ComprImg>
++                </CommonProperty>
++                <FileArmAds>
++                  <Cads>
++                    <interw>2</interw>
++                    <Optim>0</Optim>
++                    <oTime>2</oTime>
++                    <SplitLS>2</SplitLS>
++                    <OneElfS>2</OneElfS>
++                    <Strict>2</Strict>
++                    <EnumInt>2</EnumInt>
++                    <PlainCh>2</PlainCh>
++                    <Ropi>2</Ropi>
++                    <Rwpi>2</Rwpi>
++                    <wLevel>0</wLevel>
++                    <uThumb>2</uThumb>
++                    <uSurpInc>2</uSurpInc>
++                    <uC99>2</uC99>
++                    <uGnu>2</uGnu>
++                    <useXO>2</useXO>
++                    <v6Lang>0</v6Lang>
++                    <v6LangP>0</v6LangP>
++                    <vShortEn>2</vShortEn>
++                    <vShortWch>2</vShortWch>
++                    <v6Lto>2</v6Lto>
++                    <v6WtE>2</v6WtE>
++                    <v6Rtti>2</v6Rtti>
++                  </Cads>
++                  <Aads>
++                    <interw>2</interw>
++                    <Ropi>2</Ropi>
++                    <Rwpi>2</Rwpi>
++                    <thumb>2</thumb>
++                    <SplitLS>2</SplitLS>
++                    <SwStkChk>2</SwStkChk>
++                    <NoWarn>2</NoWarn>
++                    <uSurpInc>2</uSurpInc>
++                    <useXO>2</useXO>
++                    <ClangAsOpt>1</ClangAsOpt>
++                  </Aads>
++                </FileArmAds>
++              </FileOption>
++            </File>
++            <File>
++              <FileName>stm32l4xx_hal_tim_ex.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>../Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_tim_ex.c</FilePath>
++              <FileOption>
++                <CommonProperty>
++                  <UseCPPCompiler>2</UseCPPCompiler>
++                  <RVCTCodeConst>0</RVCTCodeConst>
++                  <RVCTZI>0</RVCTZI>
++                  <RVCTOtherData>0</RVCTOtherData>
++                  <ModuleSelection>0</ModuleSelection>
++                  <IncludeInBuild>1</IncludeInBuild>
++                  <AlwaysBuild>2</AlwaysBuild>
++                  <GenerateAssemblyFile>2</GenerateAssemblyFile>
++                  <AssembleAssemblyFile>2</AssembleAssemblyFile>
++                  <PublicsOnly>2</PublicsOnly>
++                  <StopOnExitCode>11</StopOnExitCode>
++                  <ComprImg>1</ComprImg>
++                </CommonProperty>
++                <FileArmAds>
++                  <Cads>
++                    <interw>2</interw>
++                    <Optim>0</Optim>
++                    <oTime>2</oTime>
++                    <SplitLS>2</SplitLS>
++                    <OneElfS>2</OneElfS>
++                    <Strict>2</Strict>
++                    <EnumInt>2</EnumInt>
++                    <PlainCh>2</PlainCh>
++                    <Ropi>2</Ropi>
++                    <Rwpi>2</Rwpi>
++                    <wLevel>0</wLevel>
++                    <uThumb>2</uThumb>
++                    <uSurpInc>2</uSurpInc>
++                    <uC99>2</uC99>
++                    <uGnu>2</uGnu>
++                    <useXO>2</useXO>
++                    <v6Lang>0</v6Lang>
++                    <v6LangP>0</v6LangP>
++                    <vShortEn>2</vShortEn>
++                    <vShortWch>2</vShortWch>
++                    <v6Lto>2</v6Lto>
++                    <v6WtE>2</v6WtE>
++                    <v6Rtti>2</v6Rtti>
++                  </Cads>
++                  <Aads>
++                    <interw>2</interw>
++                    <Ropi>2</Ropi>
++                    <Rwpi>2</Rwpi>
++                    <thumb>2</thumb>
++                    <SplitLS>2</SplitLS>
++                    <SwStkChk>2</SwStkChk>
++                    <NoWarn>2</NoWarn>
++                    <uSurpInc>2</uSurpInc>
++                    <useXO>2</useXO>
++                    <ClangAsOpt>1</ClangAsOpt>
++                  </Aads>
++                </FileArmAds>
++              </FileOption>
++            </File>
+           </Files>
+         </Group>
+         <Group>
+@@ -602,18 +719,17 @@
+       </Groups>
+     </Target>
+   </Targets>
+-
+   <RTE>
+-    <apis/>
++    <apis />
+     <components>
+       <component Cclass="CMSIS" Cgroup="CORE" Cvendor="ARM" Cversion="6.2.0" condition="ARMv6_7_8-M Device" ymlID="CMSIS:CORE">
+-        <package name="CMSIS" schemaVersion="1.7.53" url="https://www.keil.com/pack/" vendor="ARM" version="6.3.0"/>
++        <package name="CMSIS" schemaVersion="1.7.53" url="https://www.keil.com/pack/" vendor="ARM" version="6.3.0" />
+         <targetInfos>
+-          <targetInfo name="hub3"/>
++          <targetInfo name="hub3" />
+         </targetInfos>
+       </component>
+     </components>
+-    <files/>
++    <files />
+   </RTE>
+-
+ </Project>
++
+diff --git a/Src/main.c b/Src/main.c
+index 2d04b33..74c2458 100644
+--- a/Src/main.c
++++ b/Src/main.c
+@@ -61,6 +61,8 @@ RTC_HandleTypeDef hrtc;
+ 
+ SPI_HandleTypeDef hspi1;
+ 
++TIM_HandleTypeDef htim6;
++
+ /* USER CODE BEGIN PV */
+ uint16_t adc_value=0;
+ /*
+@@ -81,6 +83,7 @@ static void MX_ADC1_Init(void);
+ static void MX_UART4_Init(void);
+ static void MX_LPUART1_UART_Init(void);
+ static void MX_RTC_Init(void);
++static void MX_TIM6_Init(void);
+ /* USER CODE BEGIN PFP */
+ /*
+ */
+@@ -140,36 +143,18 @@ int main(void)
+   MX_UART4_Init();
+   MX_LPUART1_UART_Init();
+   MX_RTC_Init();
++  MX_TIM6_Init();
+   /* USER CODE BEGIN 2 */
+-	
+-	/*
+-	* Инициализация программной стейт-машины LOGGER.
+-	*
+-	* После этого вызова:
+-	* req_mode = MODE_TEST;
+-	* state    = COMMAND_INFO.
+-	*/
+-	LoggerStateMachine_Init(&logger);	
+-	
+-  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+-#ifdef DEBUG_MODE
+-  HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_RESET);
+-#else
+-  HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_SET);
+-#endif
+ 
++  /* USER CODE END 2 */
+ 
+-
+-
+-while (1)
++  /* Infinite loop */
++  /* USER CODE BEGIN WHILE */
++  while (1)
+   {
+-		/*
+-     * Выполняем один шаг основной стейт-машины LOGGER.
+-     *
+-     * Функция не блокирует главный цикл и после обработки
+-     * текущего состояния возвращает управление сюда.
+-     */
+-    LoggerStateMachine_Process(&logger);
++    /* USER CODE END WHILE */
++
++    /* USER CODE BEGIN 3 */
+   }
+   /* USER CODE END 3 */
+ }
+@@ -587,6 +572,44 @@ static void MX_SPI1_Init(void)
+ 
+ }
+ 
++/**
++  * @brief TIM6 Initialization Function
++  * @param None
++  * @retval None
++  */
++static void MX_TIM6_Init(void)
++{
++
++  /* USER CODE BEGIN TIM6_Init 0 */
++
++  /* USER CODE END TIM6_Init 0 */
++
++  TIM_MasterConfigTypeDef sMasterConfig = {0};
++
++  /* USER CODE BEGIN TIM6_Init 1 */
++
++  /* USER CODE END TIM6_Init 1 */
++  htim6.Instance = TIM6;
++  htim6.Init.Prescaler = 63999;
++  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
++  htim6.Init.Period = 99;
++  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
++  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
++  {
++    Error_Handler();
++  }
++  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
++  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
++  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
++  {
++    Error_Handler();
++  }
++  /* USER CODE BEGIN TIM6_Init 2 */
++
++  /* USER CODE END TIM6_Init 2 */
++
++}
++
+ /**
+   * Enable DMA controller clock
+   */
+diff --git a/Src/stm32l4xx_hal_msp.c b/Src/stm32l4xx_hal_msp.c
+index 2ed51fb..054e976 100644
+--- a/Src/stm32l4xx_hal_msp.c
++++ b/Src/stm32l4xx_hal_msp.c
+@@ -647,6 +647,57 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
+ 
+ }
+ 
++/**
++  * @brief TIM_Base MSP Initialization
++  * This function configures the hardware resources used in this example
++  * @param htim_base: TIM_Base handle pointer
++  * @retval None
++  */
++void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
++{
++  if(htim_base->Instance==TIM6)
++  {
++    /* USER CODE BEGIN TIM6_MspInit 0 */
++
++    /* USER CODE END TIM6_MspInit 0 */
++    /* Peripheral clock enable */
++    __HAL_RCC_TIM6_CLK_ENABLE();
++    /* TIM6 interrupt Init */
++    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
++    HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
++    /* USER CODE BEGIN TIM6_MspInit 1 */
++
++    /* USER CODE END TIM6_MspInit 1 */
++
++  }
++
++}
++
++/**
++  * @brief TIM_Base MSP De-Initialization
++  * This function freeze the hardware resources used in this example
++  * @param htim_base: TIM_Base handle pointer
++  * @retval None
++  */
++void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
++{
++  if(htim_base->Instance==TIM6)
++  {
++    /* USER CODE BEGIN TIM6_MspDeInit 0 */
++
++    /* USER CODE END TIM6_MspDeInit 0 */
++    /* Peripheral clock disable */
++    __HAL_RCC_TIM6_CLK_DISABLE();
++
++    /* TIM6 interrupt DeInit */
++    HAL_NVIC_DisableIRQ(TIM6_DAC_IRQn);
++    /* USER CODE BEGIN TIM6_MspDeInit 1 */
++
++    /* USER CODE END TIM6_MspDeInit 1 */
++  }
++
++}
++
+ /* USER CODE BEGIN 1 */
+ 
+ /* USER CODE END 1 */
+diff --git a/Src/stm32l4xx_it.c b/Src/stm32l4xx_it.c
+index bad0733..5a172eb 100644
+--- a/Src/stm32l4xx_it.c
++++ b/Src/stm32l4xx_it.c
+@@ -64,6 +64,7 @@ extern UART_HandleTypeDef hlpuart1;
+ extern UART_HandleTypeDef huart4;
+ extern UART_HandleTypeDef huart2;
+ extern UART_HandleTypeDef huart3;
++extern TIM_HandleTypeDef htim6;
+ /* USER CODE BEGIN EV */
+ 
+ /* USER CODE END EV */
+@@ -248,6 +249,20 @@ void UART4_IRQHandler(void)
+   /* USER CODE END UART4_IRQn 1 */
+ }
+ 
++/**
++  * @brief This function handles TIM6 global interrupt, DAC channel1 and channel2 underrun error interrupts.
++  */
++void TIM6_DAC_IRQHandler(void)
++{
++  /* USER CODE BEGIN TIM6_DAC_IRQn 0 */
++
++  /* USER CODE END TIM6_DAC_IRQn 0 */
++  HAL_TIM_IRQHandler(&htim6);
++  /* USER CODE BEGIN TIM6_DAC_IRQn 1 */
++
++  /* USER CODE END TIM6_DAC_IRQn 1 */
++}
++
+ /**
+   * @brief This function handles DMA2 channel1 global interrupt.
+   */
+diff --git a/hub3.ioc b/hub3.ioc
+index e774276..5a7a992 100644
+--- a/hub3.ioc
++++ b/hub3.ioc
+@@ -111,8 +111,9 @@ Mcu.CPN=STM32L4P5RET6
+ Mcu.Family=STM32L4
+ Mcu.IP0=ADC1
+ Mcu.IP1=DMA
+-Mcu.IP10=USART2
+-Mcu.IP11=USART3
++Mcu.IP10=UART4
++Mcu.IP11=USART2
++Mcu.IP12=USART3
+ Mcu.IP2=FATFS
+ Mcu.IP3=LPUART1
+ Mcu.IP4=NVIC
+@@ -120,8 +121,8 @@ Mcu.IP5=RCC
+ Mcu.IP6=RTC
+ Mcu.IP7=SPI1
+ Mcu.IP8=SYS
+-Mcu.IP9=UART4
+-Mcu.IPNb=12
++Mcu.IP9=TIM6
++Mcu.IPNb=13
+ Mcu.Name=STM32L4P5R(G-E)Tx
+ Mcu.Package=LQFP64
+ Mcu.Pin0=PC13
+@@ -141,6 +142,7 @@ Mcu.Pin20=VP_FATFS_VS_Generic
+ Mcu.Pin21=VP_RTC_VS_RTC_Activate
+ Mcu.Pin22=VP_RTC_VS_RTC_Calendar
+ Mcu.Pin23=VP_SYS_VS_Systick
++Mcu.Pin24=VP_TIM6_VS_ClockSourceINT
+ Mcu.Pin3=PC2
+ Mcu.Pin4=PA0
+ Mcu.Pin5=PA1
+@@ -148,7 +150,7 @@ Mcu.Pin6=PA2
+ Mcu.Pin7=PA3
+ Mcu.Pin8=PA4
+ Mcu.Pin9=PA5
+-Mcu.PinsNb=24
++Mcu.PinsNb=25
+ Mcu.ThirdPartyNb=0
+ Mcu.UserConstants=
+ Mcu.UserName=STM32L4P5RETx
+@@ -170,6 +172,7 @@ NVIC.PendSV_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+ NVIC.PriorityGroup=NVIC_PRIORITYGROUP_4
+ NVIC.SVCall_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+ NVIC.SysTick_IRQn=true\:15\:0\:false\:false\:true\:false\:true\:false
++NVIC.TIM6_DAC_IRQn=true\:1\:0\:true\:false\:true\:true\:true\:true
+ NVIC.UART4_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+ NVIC.USART2_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+ NVIC.USART3_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+@@ -282,7 +285,7 @@ ProjectManager.ToolChainLocation=
+ ProjectManager.UAScriptAfterPath=
+ ProjectManager.UAScriptBeforePath=
+ ProjectManager.UnderRoot=false
+-ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_USART3_UART_Init-USART3-false-HAL-true,5-MX_USART2_UART_Init-USART2-false-HAL-true,6-MX_SPI1_Init-SPI1-false-HAL-true,7-MX_FATFS_Init-FATFS-false-HAL-false,8-MX_ADC1_Init-ADC1-false-HAL-true,9-MX_UART4_Init-UART4-false-HAL-true,10-MX_LPUART1_UART_Init-LPUART1-false-HAL-true,11-MX_RTC_Init-RTC-false-HAL-true
++ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_USART3_UART_Init-USART3-false-HAL-true,5-MX_USART2_UART_Init-USART2-false-HAL-true,6-MX_SPI1_Init-SPI1-false-HAL-true,7-MX_FATFS_Init-FATFS-false-HAL-false,8-MX_ADC1_Init-ADC1-false-HAL-true,9-MX_UART4_Init-UART4-false-HAL-true,10-MX_LPUART1_UART_Init-LPUART1-false-HAL-true,11-MX_RTC_Init-RTC-false-HAL-true,12-MX_TIM6_Init-TIM6-false-HAL-true
+ RCC.ADCFreq_Value=32000000
+ RCC.AHBFreq_Value=64000000
+ RCC.APB1Freq_Value=64000000
+@@ -353,6 +356,9 @@ SPI1.Direction=SPI_DIRECTION_2LINES
+ SPI1.IPParameters=VirtualType,Mode,Direction,CalculateBaudRate,DataSize,BaudRatePrescaler
+ SPI1.Mode=SPI_MODE_MASTER
+ SPI1.VirtualType=VM_MASTER
++TIM6.IPParameters=Prescaler,Period
++TIM6.Period=99
++TIM6.Prescaler=63999
+ UART4.BaudRate=19200
+ UART4.IPParameters=BaudRate
+ USART2.IPParameters=VirtualMode-Asynchronous
+@@ -367,4 +373,6 @@ VP_RTC_VS_RTC_Calendar.Mode=RTC_Calendar
+ VP_RTC_VS_RTC_Calendar.Signal=RTC_VS_RTC_Calendar
+ VP_SYS_VS_Systick.Mode=SysTick
+ VP_SYS_VS_Systick.Signal=SYS_VS_Systick
++VP_TIM6_VS_ClockSourceINT.Mode=Enable_Timer
++VP_TIM6_VS_ClockSourceINT.Signal=TIM6_VS_ClockSourceINT
+ board=custom
