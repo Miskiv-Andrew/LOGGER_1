@@ -22,11 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define DEBUG_MODE
 #include <string.h>
 #include <stdio.h>
 #include "logger_types.h"
 #include "logger_state_machine.h"
+#include "gps.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,12 +65,72 @@ TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN PV */
 uint16_t adc_value=0;
+
 /*
  * Основной объект стейт-машины LOGGER.
  * Содержит текущее состояние всей логики программы.
  */
 LoggerStateMachine logger;
+
+
+/*
+ * Размер DMA-буфера приёма USART2 (RadioLine).
+ *
+ * В этот буфер DMA непосредственно записывает байты,
+ * поступающие по USART2.
+ */
+#define RADIOLINE_DMA_RX_BUFFER_SIZE    256U
+
+/*
+ * Размер общего буфера RadioLine.
+ *
+ * В него будем последовательно накапливать весь burst:
+ * один пакет либо несколько подряд идущих копий пакета.
+ *
+ * Конкретный размер позже при необходимости скорректируем
+ * по максимальному размеру команды протокола.
+ */
+#define RADIOLINE_RX_BUFFER_SIZE        2048U
+
+/*
+ * Рабочий буфер DMA для USART2.
+ *
+ * HAL_UARTEx_ReceiveToIdle_DMA() будет принимать сюда
+ * очередную порцию данных от RadioLine.
+ */
+static uint8_t radioline_dma_rx_buffer[RADIOLINE_DMA_RX_BUFFER_SIZE];
+
+
+/*
+ * Общий накопительный буфер RadioLine.
+ * После каждого события приёма данные из DMA-буфера
+ * будут добавляться сюда. После 100 мс тишины этот
+ * буфер будет готов к обработке в COMMAND_INFO.
+ */
+uint8_t radioline_rx_buffer[RADIOLINE_RX_BUFFER_SIZE];
+
+
+/*
+ * Текущее количество принятых байтов в общем
+ * накопительном буфере RadioLine.
+ */
+volatile uint16_t radioline_rx_length = 0U;
+
+
+/*
+ * Флаг завершения приёма burst RadioLine.
+ *
+ * 0 - burst ещё принимается;
+ * 1 - после последнего принятого байта прошло 100 мс.
+ */
+volatile uint8_t com_info = 0U;
+
+
+/* Буферы и управление GPS вынесены в gps.c. */
+
 /* USER CODE END PV */
+
+
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -84,6 +144,7 @@ static void MX_UART4_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_RTC_Init(void);
 static void MX_TIM6_Init(void);
+
 /* USER CODE BEGIN PFP */
 /*
 */
@@ -94,9 +155,250 @@ static void MX_TIM6_Init(void);
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-	
+    /*
+		 * Общий callback приёма данных UART.
+		 *
+		 * USART2 — приём команд RadioLine.
+		 * USART3 — приём данных GPS.
+		 *
+		 * Обработка каждого интерфейса выполняется
+		 * независимо от остальных.
+		 */
+
+		/*
+		* Последняя обработанная позиция в циклическом DMA-буфере USART2.
+		*
+		* DMA USART2 работает в режиме DMA_CIRCULAR.
+		* Поэтому после события IDLE DMA не перезапускается, а продолжает
+		* записывать следующие байты дальше в radioline_dma_rx_buffer.
+		*
+		* Эта переменная позволяет определить, какие именно байты появились
+		* с момента предыдущего вызова HAL_UARTEx_RxEventCallback().
+		*/
+		static uint16_t radioline_dma_old_pos = 0U;	
+			
+			
+		if (huart->Instance == USART2)
+		{
+				/*
+				 * USART2 RX DMA работает в режиме DMA_CIRCULAR.
+				 *
+				 * В этом режиме параметр Size НЕ является просто размером
+				 * очередной независимой порции данных.
+				 *
+				 * Size указывает текущую позицию DMA в циклическом буфере:
+				 * данные доступны до позиции Size.
+				 *
+				 * Поэтому необходимо копировать только те байты,
+				 * которые появились после предыдущего вызова callback.
+				 */
+
+				uint16_t new_data_length = 0U;
+
+
+				/*
+				 * СЛУЧАЙ 1.
+				 *
+				 * DMA ещё не дошёл до конца буфера.
+				 *
+				 * Например:
+				 *
+				 * radioline_dma_old_pos = 0
+				 * Size                  = 14
+				 *
+				 * Значит новые данные находятся:
+				 *
+				 * radioline_dma_rx_buffer[0 ... 13]
+				 */
+				if (Size > radioline_dma_old_pos)
+				{
+						new_data_length = Size - radioline_dma_old_pos;
+
+						/*
+						 * Проверяем, помещаются ли новые данные
+						 * в накопительный буфер RadioLine.
+						 */
+						if ((radioline_rx_length + new_data_length) <=
+								RADIOLINE_RX_BUFFER_SIZE)
+						{
+								memcpy(&radioline_rx_buffer[radioline_rx_length],
+											 &radioline_dma_rx_buffer[radioline_dma_old_pos],
+											 new_data_length);
+
+								radioline_rx_length += new_data_length;
+						}
+				}
+
+
+				/*
+				 * СЛУЧАЙ 2.
+				 *
+				 * DMA дошёл до конца циклического буфера и начал запись
+				 * снова с его начала.
+				 *
+				 * Например:
+				 *
+				 * старая позиция = 250
+				 * новая Size     = 10
+				 *
+				 * Тогда новые данные расположены двумя участками:
+				 *
+				 * [250 ... 255]
+				 *
+				 * и
+				 *
+				 * [0 ... 9]
+				 */
+				else if (Size < radioline_dma_old_pos)
+				{
+						uint16_t tail_length =
+								RADIOLINE_DMA_RX_BUFFER_SIZE - radioline_dma_old_pos;
+
+						uint16_t head_length = Size;
+
+						new_data_length = tail_length + head_length;
+
+						/*
+						 * Проверяем место сразу для обоих участков,
+						 * чтобы не записать только половину новых данных.
+						 */
+						if ((radioline_rx_length + new_data_length) <=
+								RADIOLINE_RX_BUFFER_SIZE)
+						{
+								/*
+								 * Сначала копируем остаток данных
+								 * от старой позиции до конца DMA-буфера.
+								 */
+								if (tail_length > 0U)
+								{
+										memcpy(&radioline_rx_buffer[radioline_rx_length],
+													 &radioline_dma_rx_buffer[radioline_dma_old_pos],
+													 tail_length);
+
+										radioline_rx_length += tail_length;
+								}
+
+								/*
+								 * Затем копируем данные, которые DMA уже записал
+								 * с начала циклического буфера.
+								 */
+								if (head_length > 0U)
+								{
+										memcpy(&radioline_rx_buffer[radioline_rx_length],
+													 &radioline_dma_rx_buffer[0],
+													 head_length);
+
+										radioline_rx_length += head_length;
+								}
+						}
+				}
+
+
+				/*
+				 * Запоминаем текущую позицию DMA.
+				 *
+				 * Особый случай Size == RADIOLINE_DMA_RX_BUFFER_SIZE:
+				 * DMA дошёл до конца буфера и в circular mode следующая запись
+				 * начнётся снова с позиции 0.
+				 */
+				if (Size >= RADIOLINE_DMA_RX_BUFFER_SIZE)
+				{
+						radioline_dma_old_pos = 0U;
+				}
+				else
+				{
+						radioline_dma_old_pos = Size;
+				}
+
+
+				/*
+				 * Таймер 100 мс перезапускаем только тогда,
+				 * когда действительно появились новые данные.
+				 *
+				 * TIM6 используется для определения окончания
+				 * сообщения RadioLine по паузе.
+				 */
+				if (new_data_length > 0U)
+				{
+						/*
+						 * Останавливаем предыдущий отсчёт.
+						 */
+						HAL_TIM_Base_Stop_IT(&htim6);
+
+						/*
+						 * Начинаем отсчёт 100 мс заново.
+						 */
+						__HAL_TIM_SET_COUNTER(&htim6, 0U);
+
+						HAL_TIM_Base_Start_IT(&htim6);
+				}
+
+
+				/*
+				 * ВАЖНО:
+				 *
+				 * HAL_UARTEx_ReceiveToIdle_DMA() здесь НЕ вызываем.
+				 *
+				 * USART2 RX DMA настроен в DMA_CIRCULAR.
+				 * После IDLE DMA автоматически продолжает работать.
+				 *
+				 * Повторный вызов HAL_UARTEx_ReceiveToIdle_DMA()
+				 * здесь привёл бы к HAL_BUSY, потому что текущий
+				 * DMA-приём всё ещё активен.
+				 */
+		}		
+		
+		
+		
+		
+    /* GPS: ISR только переносит данные; разбор NMEA выполняется в main loop. */
+    if (huart->Instance == USART3)
+    {
+        GPS_RxEventCallback(Size);
+        return;
+    }
+
 }
 
+
+/* Ошибки GPS USART3 сигнализируем стейт-машине без блокировки в ISR. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3)
+        GPS_NotifyUartError();
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    /*
+     * Этот callback HAL может вызываться для разных таймеров.
+     * Нас сейчас интересует только TIM6 — таймер контроля
+     * паузы между данными RadioLine.
+     */
+    if (htim->Instance == TIM6)
+    {
+        /*
+         * TIM6 дошёл до конца периода.
+         *
+         * При текущей настройке это означает, что после
+         * последней принятой порции USART2 прошло 100 мс.
+         *
+         * Останавливаем таймер, потому что он нам нужен
+         * как однократный таймер ожидания тишины.
+         */
+        HAL_TIM_Base_Stop_IT(&htim6);
+
+        /*
+         * Сообщаем основной программе:
+         *
+         * burst RadioLine закончен,
+         * накопленные данные можно обрабатывать.
+         *
+         * Сам разбор пакета здесь НЕ выполняем.
+         */
+        com_info = 1U;
+    }
+}
 
 /* USER CODE END PFP */
 
@@ -145,7 +447,8 @@ int main(void)
   MX_RTC_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
-
+	
+	
 	/*
 	* Инициализация программной стейт-машины LOGGER.
 	*
@@ -154,6 +457,7 @@ int main(void)
 	* state    = COMMAND_INFO.
 	*/
 	LoggerStateMachine_Init(&logger);
+	GPS_Init();
 
 	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
@@ -162,6 +466,32 @@ int main(void)
 	#else
 	HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_SET);
 	#endif
+	
+	
+	/*
+	* Запускаем постоянный приём данных RadioLine по USART2 через DMA.
+	*
+	* HAL_UARTEx_ReceiveToIdle_DMA():
+	* - USART2 принимает данные;
+	* - DMA записывает их в radioline_dma_rx_buffer;
+	* - при событии приёма HAL вызовет HAL_UARTEx_RxEventCallback().
+	*
+	* Сейчас мы только запускаем механизм приёма.
+	* Обработку полученных данных добавим следующим шагом.
+	*/
+	if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, radioline_dma_rx_buffer, RADIOLINE_DMA_RX_BUFFER_SIZE) != HAL_OK)
+	{
+		Error_Handler();
+	}
+
+	/*
+	* Отключаем прерывание DMA по половине заполненного буфера.
+	*
+	* Для RadioLine оно нам не требуется. Нас интересуют полученные
+	* данные целиком и события окончания текущей порции приёма.
+	*/
+	__HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+	
 
   /* USER CODE END 2 */
 
@@ -179,10 +509,13 @@ int main(void)
 			* Функция не блокирует главный цикл и после обработки
 			* текущего состояния возвращает управление сюда.
 			*/
-			LoggerStateMachine_Process(&logger);
+			LoggerStateMachine_Process(&logger);	
+		
   }
   /* USER CODE END 3 */
 }
+
+
 
 /**
   * @brief System Clock Configuration
