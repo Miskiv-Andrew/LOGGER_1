@@ -27,6 +27,8 @@
 #include "logger_types.h"
 #include "logger_state_machine.h"
 #include "gps.h"
+#include "lidar.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,7 +63,10 @@ RTC_HandleTypeDef hrtc;
 
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
+
+
 
 /* USER CODE BEGIN PV */
 uint16_t adc_value=0;
@@ -71,6 +76,21 @@ uint16_t adc_value=0;
  * Содержит текущее состояние всей логики программы.
  */
 LoggerStateMachine logger;
+
+
+/*
+ * Глобальный счётчик секунд RTC.
+ *
+ * Увеличивается на единицу при каждом прерывании
+ * RTC WakeUp Timer (период 1 секунда).
+ *
+ * Значение никогда не обнуляется программой.
+ * Основная стейт-машина только читает счётчик.
+ *
+ * volatile необходим, поскольку счётчик изменяется
+ * в обработчике прерывания RTC.
+ */
+volatile uint32_t rtc_seconds = 0U;
 
 
 /*
@@ -125,12 +145,32 @@ volatile uint16_t radioline_rx_length = 0U;
  */
 volatile uint8_t com_info = 0U;
 
+/*
+ * ============================================================================
+ * Флаг срабатывания общего таймера контроля ответа прибора TIM3.
+ *
+ * TIM3 используется для ограничения времени ожидания ответа
+ * от текущего прибора.
+ *
+ * Сам callback таймера НЕ принимает никаких решений и НЕ изменяет
+ * состояние LOGGER. Он только устанавливает этот флаг.
+ *
+ * Обработка таймаута выполняется позже основной стейт-машиной,
+ * которая по logger->dev_type определяет, ответ какого прибора ожидался.
+ *
+ * volatile необходим, поскольку значение изменяется из прерывания,
+ * а читается из основного цикла программы.
+ *
+ * 0 - таймаут не произошёл;
+ * 1 - время ожидания ответа прибора истекло.
+ * ============================================================================
+ */
+volatile uint8_t device_timeout = 0U;
+
 
 /* Буферы и управление GPS вынесены в gps.c. */
 
 /* USER CODE END PV */
-
-
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -144,7 +184,7 @@ static void MX_UART4_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_RTC_Init(void);
 static void MX_TIM6_Init(void);
-
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 /*
 */
@@ -366,39 +406,91 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3)
         GPS_NotifyUartError();
+		
+		/*
+		 * Ошибка приёма данных LIDAR через LPUART1.
+		 * Сообщаем модулю LIDAR о неисправности текущего приёма.
+		 */
+		if (huart->Instance == LPUART1)
+		{
+				LIDAR_NotifyUartError();
+				return;
+		}
+		
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     /*
-     * Этот callback HAL может вызываться для разных таймеров.
-     * Нас сейчас интересует только TIM6 — таймер контроля
-     * паузы между данными RadioLine.
+     * ========================================================================
+     * TIM6
+     * ========================================================================
+     *
+     * Таймер окончания burst RadioLine.
+     *
+     * Если после последнего принятого байта RadioLine прошло 100 мс,
+     * считаем текущий burst завершённым.
+     *
+     * Эту существующую логику не изменяем.
      */
     if (htim->Instance == TIM6)
     {
         /*
-         * TIM6 дошёл до конца периода.
+         * Останавливаем TIM6.
          *
-         * При текущей настройке это означает, что после
-         * последней принятой порции USART2 прошло 100 мс.
-         *
-         * Останавливаем таймер, потому что он нам нужен
-         * как однократный таймер ожидания тишины.
+         * Следующий запуск произойдёт после поступления новых данных
+         * RadioLine.
          */
         HAL_TIM_Base_Stop_IT(&htim6);
 
         /*
-         * Сообщаем основной программе:
-         *
-         * burst RadioLine закончен,
-         * накопленные данные можно обрабатывать.
-         *
-         * Сам разбор пакета здесь НЕ выполняем.
+         * Сообщаем основному циклу, что накопленный burst RadioLine
+         * готов к обработке.
          */
         com_info = 1U;
+
+        return;
+    }
+
+
+    /*
+     * ========================================================================
+     * TIM3
+     * ========================================================================
+     *
+     * Общий таймер контроля времени ожидания ответа прибора.
+     *
+     * TIM3 настроен в One Pulse Mode, поэтому после истечения заданного
+     * интервала используется как одноразовое событие таймаута.
+     *
+     * ВАЖНО:
+     *
+     * В прерывании:
+     *
+     * - НЕ определяем тип прибора;
+     * - НЕ изменяем logger->state;
+     * - НЕ отправляем пакеты RadioLine;
+     * - НЕ выполняем обработку ошибки;
+     * - НЕ запускаем стейт-машину.
+     *
+     * Callback только сообщает основной программе о том, что время
+     * ожидания ответа текущего прибора истекло.
+     *
+     * Какой прибор ожидался, основная стейт-машина определит
+     * по logger->dev_type.
+     */
+    if (htim->Instance == TIM3)
+    {
+        /*
+         * Фиксируем событие таймаута.
+         */
+        device_timeout = 1U;
+
+        return;
     }
 }
+
+
 
 /* USER CODE END PFP */
 
@@ -446,8 +538,9 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_RTC_Init();
   MX_TIM6_Init();
-  /* USER CODE BEGIN 2 */
+  MX_TIM3_Init();
 	
+  /* USER CODE BEGIN 2 */
 	
 	/*
 	* Инициализация программной стейт-машины LOGGER.
@@ -458,6 +551,13 @@ int main(void)
 	*/
 	LoggerStateMachine_Init(&logger);
 	GPS_Init();
+	/*
+	* Инициализация программного модуля LIDAR.
+	*
+	* Сбрасываем внутренние буферы, счётчики и флаги.
+	* Приём данных пока не запускаем.
+	*/
+	LIDAR_Init();
 
 	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
@@ -514,8 +614,6 @@ int main(void)
   }
   /* USER CODE END 3 */
 }
-
-
 
 /**
   * @brief System Clock Configuration
@@ -884,6 +982,14 @@ static void MX_RTC_Init(void)
   {
     Error_Handler();
   }
+
+  /** Enable the WakeUp
+  */
+  //if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 59, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0) != HAL_OK)
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 0, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
@@ -927,6 +1033,55 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 63999;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 4999; 	
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OnePulse_Init(&htim3, TIM_OPMODE_SINGLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
 
 }
 
@@ -1057,6 +1212,47 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief Обработка завершения приёма UART через DMA.
+ *
+ * Для LIDAR используется LPUART1.
+ * После приёма 45 байтов управление передаётся
+ * модулю lidar.c.
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    /*
+     * Проверяем, что прерывание относится именно к LPUART1.
+     * Другие UART здесь не обрабатываем.
+     */
+    if (huart->Instance == LPUART1)
+    {
+        /*
+         * Модуль LIDAR остановит DMA-приём
+         * и установит флаг готовности lidar_info.
+         */
+        LIDAR_RxCpltCallback();
+        return;
+    }
+}
+
+/*
+ * Callback секундного прерывания RTC WakeUp Timer.
+ *
+ * Вызывается библиотекой HAL после обработки
+ * прерывания RTC_WKUP_IRQHandler().
+ *
+ * Каждое срабатывание соответствует одной секунде.
+ *
+ * В прерывании выполняется только увеличение счётчика.
+ * Никаких переходов состояний, запросов приборов
+ * и других операций здесь нет.
+ */
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
+{
+    if (hrtc->Instance == RTC) rtc_seconds++;
+}
 
 /* USER CODE END 4 */
 

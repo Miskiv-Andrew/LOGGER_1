@@ -389,6 +389,26 @@
               <FileType>2</FileType>
               <FilePath>startup_stm32l4p5xx.s</FilePath>
             </File>
+            <File>
+              <FileName>lidar.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\lidar.c</FilePath>
+            </File>
+            <File>
+              <FileName>lidar.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\lidar.h</FilePath>
+            </File>
+            <File>
+              <FileName>bdbg.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\bdbg.h</FilePath>
+            </File>
+            <File>
+              <FileName>bdbg.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\bdbg.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -413,6 +433,16 @@
               <FileName>logger_state_machine.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Src\logger_state_machine.c</FilePath>
+            </File>
+            <File>
+              <FileName>gps.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\gps.c</FilePath>
+            </File>
+            <File>
+              <FileName>gps.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\gps.h</FilePath>
             </File>
             <File>
               <FileName>main.c</FileName>
@@ -440,14 +470,14 @@
               <FilePath>../Src/stm32l4xx_hal_msp.c</FilePath>
             </File>
             <File>
-              <FileName>gps.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\gps.c</FilePath>
+              <FileName>rtc_service.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\rtc_service.h</FilePath>
             </File>
             <File>
-              <FileName>gps.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Inc\gps.h</FilePath>
+              <FileName>rtc_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\rtc_service.c</FilePath>
             </File>
           </Files>
         </Group>
