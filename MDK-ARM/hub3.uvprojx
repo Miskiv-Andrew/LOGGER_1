@@ -409,6 +409,21 @@
               <FileType>1</FileType>
               <FilePath>..\Src\bdbg.c</FilePath>
             </File>
+            <File>
+              <FileName>bdbg_protocol_15.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\bdbg_protocol_15.c</FilePath>
+            </File>
+            <File>
+              <FileName>bdbg_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\bdbg_config.h</FilePath>
+            </File>
+            <File>
+              <FileName>bdbg_protocol.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\bdbg_protocol.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
