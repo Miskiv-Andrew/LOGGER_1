@@ -28,6 +28,8 @@
 #include "logger_state_machine.h"
 #include "gps.h"
 #include "lidar.h"
+#include "bdbg.h"
+#include "bdbg_config.h"
 
 /* USER CODE END Includes */
 
@@ -402,8 +404,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
 
 /* Ошибки GPS USART3 сигнализируем стейт-машине без блокировки в ISR. */
+/* DMA normal mode: событие полного приёма БДБГ. */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+    if (huart->Instance == UART4) { BDBG_UartErrorCallback(huart); return; }
     if (huart->Instance == USART3)
         GPS_NotifyUartError();
 		
@@ -558,6 +562,7 @@ int main(void)
 	* Приём данных пока не запускаем.
 	*/
 	LIDAR_Init();
+    BDBG_Init();
 
 	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
@@ -795,10 +800,10 @@ static void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
-  huart4.Init.BaudRate = 19200;
-  huart4.Init.WordLength = UART_WORDLENGTH_8B;
-  huart4.Init.StopBits = UART_STOPBITS_1;
-  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.BaudRate = BDBG_UART_BAUDRATE;
+  huart4.Init.WordLength = BDBG_UART_WORD_LENGTH;
+  huart4.Init.StopBits = BDBG_UART_STOP_BITS;
+  huart4.Init.Parity = BDBG_UART_PARITY;
   huart4.Init.Mode = UART_MODE_TX_RX;
   huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart4.Init.OverSampling = UART_OVERSAMPLING_16;
@@ -1233,6 +1238,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
          * и установит флаг готовности lidar_info.
          */
         LIDAR_RxCpltCallback();
+        return;
+    }
+
+    /* UART4: завершён приём ответа БДБГ-15 через DMA. */
+    if (huart->Instance == UART4)
+    {
+        BDBG_RxCompleteCallback(huart);
         return;
     }
 }

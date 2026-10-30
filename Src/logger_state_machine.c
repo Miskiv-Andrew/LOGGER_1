@@ -10,6 +10,8 @@
 #include "gps.h"
 #include "rtc_service.h"
 #include "lidar.h"
+#include "bdbg.h"
+#include "bdbg_config.h"
 
 /*
  * Статический буфер для формирования пакетов RadioLine.
@@ -87,6 +89,7 @@ extern volatile uint32_t rtc_seconds;
  * Сам объект таймера создаётся и инициализируется в main.c.
  */
 extern TIM_HandleTypeDef htim3;
+extern UART_HandleTypeDef huart4;
 
 
 static HAL_StatusTypeDef RadioLine_SendPacket(
@@ -255,6 +258,24 @@ static uint8_t LoggerStateMachine_ProcessDeviceTimeout(LoggerStateMachine *logge
          * опрашиваться. Дополнительных действий нет.
          */
         logger->dev_type = DEV_NONE;
+        return 1U;
+    }
+
+    /* BDBG: истечение TIM3 обрабатывается без работы с UART в ISR. */
+    if (logger->dev_type == DEV_BDBG)
+    {
+        BDBG_StopReceive();
+        logger->dev_type = DEV_NONE;
+        if (logger->req_mode == MODE_TEST)
+        {
+            (void)RadioLine_SendPacket(8U, NULL, 0U);
+            logger->state = COMMAND_INFO;
+        }
+        else if (logger->req_mode == MODE_WORK)
+        {
+            logger->state = BDBG_ERROR_PROC;
+        }
+        else logger->state = COMMAND_INFO;
         return 1U;
     }
 
@@ -3031,8 +3052,118 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 				}
 
         case REQ_BDBG:
+        {
+            /* Приборы не должны одновременно занимать приёмные интерфейсы. */
+            GPS_StopReceive();
+            LIDAR_StopReceive();
+            device_timeout = 0U;
+            logger->dev_type = DEV_BDBG;
+            if (logger->req_mode == MODE_TEST) logger->bdbg_request = PAED_REQ;
+            /* TIM3: 64 MHz / (63999+1) = 1000 Гц; 2000 отсчётов = 2 с. */
+            (void)HAL_TIM_Base_Stop_IT(&htim3);
+            __HAL_TIM_SET_AUTORELOAD(&htim3, BDBG_RESPONSE_TIMEOUT_MS - 1U);
+            __HAL_TIM_SET_COUNTER(&htim3, 0U);
+            if (BDBG_StartRequest(&huart4, logger->bdbg_request) == 0U)
+            {
+                logger->dev_type = DEV_NONE;
+                logger->state = (logger->req_mode == MODE_TEST) ? COMMAND_INFO : BDBG_ERROR_PROC;
+                if (logger->req_mode == MODE_TEST) (void)RadioLine_SendPacket(8U, NULL, 0U);
+                break;
+            }
+            (void)HAL_TIM_Base_Start_IT(&htim3);
+            logger->state = BDBG_PROC;
+            break;
+        }
+
         case BDBG_PROC:
+        {
+            BDBG_RxStatus rx = BDBG_GetRxStatus();
+            if (rx == BDBG_RX_WAIT) break;
+            (void)HAL_TIM_Base_Stop_IT(&htim3);
+            device_timeout = 0U;
+            logger->dev_type = DEV_NONE;
+            uint8_t ok = (rx == BDBG_RX_READY) &&
+                         BDBG_ParseResponse(logger->bdbg_request, &logger->bdbg_data);
+            BDBG_StopReceive();
+            if (!ok)
+            {
+                if (logger->req_mode == MODE_TEST)
+                {
+                    (void)RadioLine_SendPacket(7U, NULL, 0U);
+                    logger->state = COMMAND_INFO;
+                }
+                else logger->state = BDBG_ERROR_PROC;
+                break;
+            }
+            logger->bdbg_error_counter = 0U;
+            if (logger->req_mode == MODE_TEST)
+            {
+                (void)RadioLine_SendPacket(9U, NULL, 0U);
+                logger->state = REQ_BATTERY;
+                break;
+            }
+            if (logger->req_mode != MODE_WORK) { logger->state = COMMAND_INFO; break; }
+            switch (logger->bdbg_request)
+            {
+                case PAED_REQ:
+                    HAL_Delay(50U);
+                    logger->bdbg_request = TEMP_REQ;
+                    logger->state = REQ_BDBG;
+                    break;
+                case TEMP_REQ:
+                    logger->state = REQ_BATTERY;
+                    break;
+                case START_SPECTRE_REQ:
+                    memset(logger->spectre_arr, 0, sizeof(logger->spectre_arr));
+                    logger->bdbg_spectrum_active = 1U;
+                    logger->bdbg_spectrum_started_s = rtc_seconds;
+                    logger->bdbg_last_poll_s = rtc_seconds;
+                    logger->work_mode = MODE_SPECTRE;
+                    logger->bdbg_request = GET_SPECTRE_REQ;
+                    logger->state = COMMAND_INFO;
+                    break;
+                case GET_SPECTRE_REQ:
+                {
+                    uint8_t near_limit = 0U;
+                    for (uint16_t i = 0U; i < BDBG_SPECTRUM_CHANNELS; ++i)
+                    {
+                        uint32_t sum = (uint32_t)logger->spectre_arr[i] +
+                                       (uint32_t)logger->bdbg_data.spectrum[i];
+                        /* Saturation avoids uint16_t wraparound on unexpected bursts. */
+                        if (sum > UINT16_MAX) sum = UINT16_MAX;
+                        logger->spectre_arr[i] = (uint16_t)sum;
+                        if (sum >= 55705U) near_limit = 1U;
+                    }
+                    logger->bdbg_last_poll_s = rtc_seconds;
+                    /* Завершение и отправка спектра пока НЕ реализованы:
+                     * требуется отдельная интеграция с протоколом RadioLine/SD. */
+                    (void)near_limit;
+                    logger->state = COMMAND_INFO;
+                    break;
+                }
+                default: logger->state = COMMAND_INFO; break;
+            }
+            break;
+        }
+
         case BDBG_ERROR_PROC:
+        {
+            (void)HAL_TIM_Base_Stop_IT(&htim3);
+            BDBG_StopReceive();
+            device_timeout = 0U;
+            logger->dev_type = DEV_NONE;
+            if (logger->req_mode == MODE_WORK)
+            {
+                if (logger->bdbg_error_counter < UINT8_MAX) logger->bdbg_error_counter++;
+                if (logger->bdbg_error_counter >= LOGGER_DEVICE_ERROR_LIMIT)
+                {
+                    (void)RadioLine_SendPacket(10U, NULL, 0U);
+                    logger->req_mode = MODE_ERROR;
+                }
+            }
+            logger->state = COMMAND_INFO;
+            break;
+        }
 
         case REQ_BATTERY:
         case BATTERY_PROC:

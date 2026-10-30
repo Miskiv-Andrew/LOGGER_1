@@ -29,6 +29,7 @@
 
 #include <stdint.h>
 #include "logger_types.h"
+#include "bdbg.h"
 
 
 /* ============================================================================
@@ -281,6 +282,14 @@ typedef struct
      * ====================================================================== */
 
     BdbgRequest bdbg_request;
+    /* Последняя корректная порция данных прибора. */
+    BDBG_Data bdbg_data;
+    /* Сумма спектров по каналам, без динамического выделения памяти. */
+    uint16_t spectre_arr[BDBG_SPECTRUM_CHANNELS];
+    uint8_t bdbg_spectrum_active;
+    uint32_t bdbg_spectrum_started_s;
+    uint32_t bdbg_last_poll_s;
+
 
 
     /* ========================================================================
