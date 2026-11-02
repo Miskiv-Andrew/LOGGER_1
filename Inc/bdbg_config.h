@@ -19,7 +19,7 @@
 
 /* Адрес основного блока и максимальное ожидание ответа. */
 #define BDBG_DEFAULT_ADDRESS       0x01U
-#define BDBG_RESPONSE_TIMEOUT_MS   2000U
+#define BDBG_RESPONSE_TIMEOUT_MS   3000U
 
 #else
 #error "BDBG_MODEL: protocol and UART configuration for this model are not implemented"

@@ -92,25 +92,108 @@ extern TIM_HandleTypeDef htim3;
 extern UART_HandleTypeDef huart4;
 
 
-static HAL_StatusTypeDef RadioLine_SendPacket(
-    uint8_t packet_id,
-    const uint8_t *payload,
-    uint16_t payload_length);
+static HAL_StatusTypeDef RadioLine_SendPacket(uint8_t packet_id, const uint8_t *payload, uint16_t payload_length);
 
 		
 		
-		
-		
-		
-		
-		
-		
-		
-		
-		
-		
-		
-		
+/*
+ * Размер полезных данных радиопакета ID23:
+ *
+ * 1024 канала по 2 байта = 2048 байт;
+ * время набора             =    2 байта;
+ * ПАЕД                     =    4 байта;
+ * состояние БДБГ           =    1 байт.
+ *
+ * Итого: 2055 байт.
+ */
+#define RADIOLINE_SPECTRUM_PAYLOAD_SIZE 2055U
+
+/*
+ * Статический буфер для очередной порции спектра.
+ *
+ * Не размещаем массив размером 2055 байт на стеке.
+ * Динамическую память не используем.
+ */
+static uint8_t radioline_spectrum_payload[ RADIOLINE_SPECTRUM_PAYLOAD_SIZE ];
+
+
+/*
+ * Формирует и передаёт радиопакет ID23.
+ *
+ * Передаётся именно очередная порция спектра БДБГ,
+ * а не накопленный массив spectre_arr[].
+ *
+ * Функция вызывается после успешной проверки ответа
+ * GET_SPECTRE_REQ.
+ */
+static HAL_StatusTypeDef RadioLine_SendSpectrum(const BDBG_Data *data)
+{
+    if (data == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * Записываем 1024 канала спектра.
+     *
+     * Каждый канал — uint16_t.
+     * Порядок байтов: LSB, затем MSB.
+     */
+    for (uint16_t i = 0U;
+         i < BDBG_SPECTRUM_CHANNELS;
+         ++i)
+    {
+        uint16_t value = data->spectrum[i];
+
+        radioline_spectrum_payload[2U * i] =
+            (uint8_t)(value & 0xFFU);
+
+        radioline_spectrum_payload[2U * i + 1U] =
+            (uint8_t)((value >> 8U) & 0xFFU);
+    }
+
+    /*
+     * Время набора из ответа БДБГ-15.
+     *
+     * Исходные байты ответа: 2054–2055.
+     * Смещение в Payload ID23: 2048–2049.
+     */
+    radioline_spectrum_payload[2048] =
+        (uint8_t)(data->acquisition_time & 0xFFU);
+
+    radioline_spectrum_payload[2049] =
+        (uint8_t)((data->acquisition_time >> 8U) & 0xFFU);
+
+    /*
+     * ПАЕД — 4 байта float IEEE-754.
+     *
+     * STM32L4 использует Little Endian.
+     * memcpy позволяет избежать небезопасного
+     * преобразования указателей разных типов.
+     */
+    memcpy(
+        &radioline_spectrum_payload[2050],
+        &data->paed_usv_h,
+        sizeof(float)
+    );
+
+    /*
+     * Состояние низко- и высокочувствительного
+     * датчиков и валидность данных БДБГ.
+     *
+     * Передаём исходный байт status без изменения
+     * его битового представления.
+     */
+    radioline_spectrum_payload[2054] = data->status;
+
+    /*
+     * ID23 — очередная порция спектра.
+     */
+    return RadioLine_SendPacket( 23U,
+        radioline_spectrum_payload,
+        RADIOLINE_SPECTRUM_PAYLOAD_SIZE
+    );
+}			
 		
 		
 
@@ -1188,24 +1271,37 @@ void LoggerStateMachine_Init(LoggerStateMachine *logger)
 		 * При запуске интервала сюда будет записано
 		 * текущее значение глобального rtc_seconds.
 		 */
-		logger->interval_start_seconds = 0U;
+		logger->interval_start_seconds = 0U;	
 		
 		
-		
-        /*
-         * Координаты последнего сохранённого полного измерения
-         * инициализируются ниже вместе с остальными GPS-данными.
-         * Заполнение этих полей после успешной записи полного
-         * измерения на SD-карту пока остаётся заглушкой.
-         */
-
-		
+		/*
+		 * Координаты последнего сохранённого полного измерения
+		 * инициализируются ниже вместе с остальными GPS-данными.
+		 * Заполнение этих полей после успешной записи полного
+		 * измерения на SD-карту пока остаётся заглушкой.
+		 */	
 		
 
     /*
      * Начальный тип запроса к БДБГ-15.
      */
     logger->bdbg_request = PAED_REQ;
+		
+		/*
+		 * После включения LOGGER спектральный режим неактивен.
+		 * Процедура остановки спектра также не выполняется.
+		 */
+		logger->bdbg_spectrum_active = 0U;
+		logger->bdbg_spectrum_stopping = 0U;
+		logger->bdbg_spectrum_started_s = 0U;
+		logger->bdbg_last_poll_s = 0U;
+
+		/*
+		 * Обнуляем накопленный спектр.
+		 * Новый набор также будет очищать этот массив
+		 * после успешного START_SPECTRE_REQ.
+		 */
+		memset(logger->spectre_arr, 0, sizeof(logger->spectre_arr));
 
 
     /* ========================================================================
@@ -1347,35 +1443,18 @@ void LoggerStateMachine_Init(LoggerStateMachine *logger)
 
     logger->radioline_data = 0;
     logger->radioline_length = 0U;
+				
+		/*
+		* Начальные значения GPS-координат и высоты LIDAR
+		* для набора спектра.
+		*
+		* После запуска LOGGER данные отсутствуют.
+		*/
+    logger->spectrum_start_coord = (Coord){0};
+    logger->spectrum_start_height_cm = 0U;
+    logger->spectrum_start_data_valid = 0U;					
+				
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 /* ============================================================================
@@ -1430,8 +1509,6 @@ uint16_t calculateCrc16(const uint8_t *data, uint16_t size)
     return crc;
 }
 
-
-
 /*
  * Дескриптор USART2, созданный в main.c.
  *
@@ -1439,8 +1516,6 @@ uint16_t calculateCrc16(const uint8_t *data, uint16_t size)
  * по каналу RadioLine.
  */
 extern UART_HandleTypeDef huart2;
-
-
 
 /*
  * Формирование и передача пакета RadioLine.
@@ -1596,13 +1671,80 @@ static HAL_StatusTypeDef RadioLine_SendPacket(
     {
         /*
          * Блокирующая передача одной копии пакета.
-         */
-        status = HAL_UART_Transmit(
-            &huart2,
-            radioline_tx_buffer,
-            (uint16_t)packet_length,
-            1000U
-        );
+				 * Рассчитываем минимальное время передачи пакета
+				 * исходя из текущей скорости USART2.
+				 *
+				 * Для формата 8N1 один байт занимает 10 бит:
+				 * стартовый бит + 8 бит данных + стоповый бит.
+				 *
+				 * Дополнительно предусматриваем запас 500 мс
+				 * на выполнение передачи.
+				 *
+				 * Расчёт выполняется в uint64_t, чтобы исключить
+				 * переполнение при умножении длины на 10000.
+				 */
+				uint32_t tx_timeout_ms = 1000U;
+
+				if (huart2.Init.BaudRate != 0U)
+				{
+						uint64_t required_ms =
+								(((uint64_t)packet_length * 10000ULL) +
+								 (uint64_t)huart2.Init.BaudRate - 1ULL) /
+								(uint64_t)huart2.Init.BaudRate;
+
+						required_ms += 500ULL;
+
+						if (required_ms > UINT32_MAX)
+						{
+								return HAL_ERROR;
+						}
+
+						tx_timeout_ms = (uint32_t)required_ms;
+				}
+
+				/*
+				 * Рассчитываем минимальное время передачи пакета
+				 * исходя из текущей скорости USART2.
+				 *
+				 * Для формата 8N1 один байт занимает 10 бит:
+				 * стартовый бит + 8 бит данных + стоповый бит.
+				 *
+				 * Дополнительно предусматриваем запас 500 мс
+				 * на выполнение передачи.
+				 *
+				 * Расчёт выполняется в uint64_t, чтобы исключить
+				 * переполнение при умножении длины на 10000.
+				 */
+				
+				if (huart2.Init.BaudRate != 0U)
+				{
+						uint64_t required_ms =
+								(((uint64_t)packet_length * 10000ULL) +
+								 (uint64_t)huart2.Init.BaudRate - 1ULL) /
+								(uint64_t)huart2.Init.BaudRate;
+
+						required_ms += 500ULL;
+
+						if (required_ms > UINT32_MAX)
+						{
+								return HAL_ERROR;
+						}
+
+						tx_timeout_ms = (uint32_t)required_ms;
+				}
+
+				/*
+				 * Передаём одну копию пакета.
+				 *
+				 * Таймаут теперь зависит от размера пакета
+				 * и скорости USART2.
+				 */
+				status = HAL_UART_Transmit(
+						&huart2,
+						radioline_tx_buffer,
+						(uint16_t)packet_length,
+						tx_timeout_ms
+				);
 
         /*
          * При ошибке прекращаем передачу
@@ -1637,6 +1779,7 @@ static HAL_StatusTypeDef RadioLine_SendPacket(
  * Здесь не должно быть бесконечных циклов ожидания.
  * После обработки текущего состояния функция возвращает управление в main().
  * ========================================================================== */
+
 void LoggerStateMachine_Process(LoggerStateMachine *logger)
 {
     /*
@@ -1759,11 +1902,62 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 *
 						 * TIM6 устанавливает com_info после паузы 100 мс.
 						 */
+					
+					
 						if (com_info == 0U)
 						{
-								break;
-						}
+								/*
+								 * Периодические запросы спектра выполняются
+								 * только в рабочем спектральном режиме.
+								 */
+								if ((logger->req_mode == MODE_WORK) &&
+										(logger->work_mode == MODE_SPECTRE) &&
+										(logger->bdbg_spectrum_active != 0U) &&
+										(logger->bdbg_spectrum_stopping == 0U))
+								{
+										/*
+										 * Сначала проверяем ограничение длительности набора.
+										 *
+										 * Значение saveSpectre == 0 означает
+										 * неограниченное время набора.
+										 */
+										if ((logger->flight_config.saveSpectre != 0U) &&
+												((uint32_t)(rtc_seconds -
+																		logger->bdbg_spectrum_started_s) >=
+												 logger->flight_config.saveSpectre))
+										{
+												/*
+												 * Время набора истекло.
+												 *
+												 * Запрещаем дальнейшие GET_SPECTRE_REQ
+												 * и подготавливаем PAED_REQ для остановки прибора.
+												 */
+												logger->bdbg_spectrum_stopping = 1U;
+												logger->bdbg_request = PAED_REQ;
+												logger->state = REQ_BDBG;
 
+												break;
+										}
+
+										/*
+										 * Если время набора ещё не истекло,
+										 * проверяем пятитисекундный интервал
+										 * получения следующей порции спектра.
+										 */
+										if ((uint32_t)(rtc_seconds -
+																	 logger->bdbg_last_poll_s) >= 5U)
+										{
+												logger->bdbg_request = GET_SPECTRE_REQ;
+												logger->state = REQ_BDBG;
+
+												break;
+										}
+								}
+
+								break;
+						}					
+						
+						
 						com_info = 0U;
 
 						/*
@@ -2107,6 +2301,63 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										}
 								}
 						}
+
+
+                        /*
+                         * ID09: изменение режима разведки.
+                         * Payload: 0=оператор, 1=время, 2=расстояние,
+                         * 3=начало набора спектра.
+                         */
+                        if ((received_command == 0x09U) &&
+                            (received_payload_length == 1U) &&
+                            (logger->req_mode == MODE_WORK))
+                        {
+                            const uint8_t requested_mode =
+                                radioline_rx_buffer[received_payload_pos];
+
+                            /* Не прерываем активный или запускаемый спектр. */
+                            if ((logger->bdbg_spectrum_active == 0U) &&
+                                (logger->bdbg_spectrum_stopping == 0U) &&
+                                (logger->work_mode != START_SPECTRE) &&
+                                (logger->work_mode != MODE_SPECTRE))
+                            {
+                                if (requested_mode <= 2U)
+                                {
+                                    /* Обычный режим: начинаем новый интервал. */
+                                    logger->work_mode = (DroneWorkMode)requested_mode;
+                                    LoggerStateMachine_StopInterval(logger);
+                                }
+                                else if (requested_mode == 3U)
+                                {
+                                    /* Сохраняем режим для восстановления после спектра. */
+                                    logger->old_work_mode = logger->work_mode;
+                                    LoggerStateMachine_StopInterval(logger);
+                                    logger->work_mode = START_SPECTRE;
+                                    logger->bdbg_spectrum_active = 0U;
+                                    logger->bdbg_spectrum_stopping = 0U;
+                                    logger->bdbg_request = START_SPECTRE_REQ;
+                                    logger->state = REQ_BDBG;
+                                }
+                            }
+                        }
+
+                        /*
+                         * ID12: досрочная остановка набора спектра.
+                         * Payload должен содержать ровно один байт 0x01.
+                         */
+                        if ((received_command == 0x0CU) &&
+                            (received_payload_length == 1U) &&
+                            (radioline_rx_buffer[received_payload_pos] == 0x01U) &&
+                            (logger->req_mode == MODE_WORK) &&
+                            (logger->work_mode == MODE_SPECTRE) &&
+                            (logger->bdbg_spectrum_active != 0U) &&
+                            (logger->bdbg_spectrum_stopping == 0U))
+                        {
+                            /* Останавливаем прибор штатной командой PAED_REQ. */
+                            logger->bdbg_spectrum_stopping = 1U;
+                            logger->bdbg_request = PAED_REQ;
+                            logger->state = REQ_BDBG;
+                        }
 
 						break;
 				}
@@ -2932,9 +3183,43 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
                 break;
             }
 
-            /* START_SPECTRE: запускаем спектр без проверки расстояния/высоты. */
+             /*
+             * START_SPECTRE:
+             *
+             * Фиксируем GPS-координаты и высоту LIDAR,
+             * полученные непосредственно перед запуском спектра.
+             *
+             * Эти значения будут использоваться при последующем
+             * сохранении накопленного спектра на SD-карту.
+             *
+             * Повторное измерение GPS и LIDAR после подтверждения
+             * START_SPECTRE_REQ не требуется.
+             */
             if (logger->work_mode == START_SPECTRE)
             {
+                /*
+                 * Сохраняем текущие GPS-координаты.
+                 *
+                 * Проверка достоверности GPS выполняется
+                 * ранее в последовательности состояний
+                 * утверждённой стейт-машины.
+                 */
+                logger->spectrum_start_coord = logger->gps_data.current_coord;
+
+                /*
+                 * Сохраняем высоту из только что обработанного
+                 * корректного измерения LIDAR.
+                 */
+                logger->spectrum_start_height_cm = measurement.distance_cm;
+
+                /*
+                 * Обе величины зафиксированы.
+                 */
+                logger->spectrum_start_data_valid = 1U;
+
+                /*
+                 * Существующий переход не изменяем.
+                 */
                 logger->bdbg_request = START_SPECTRE_REQ;
                 logger->state = REQ_BDBG;
                 break;
@@ -2986,6 +3271,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             logger->state = COMMAND_INFO;
             break;
         }
+				
+				
+				
 
         case LIDAR_ERROR_PROC:
 				{
@@ -3059,7 +3347,7 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             device_timeout = 0U;
             logger->dev_type = DEV_BDBG;
             if (logger->req_mode == MODE_TEST) logger->bdbg_request = PAED_REQ;
-            /* TIM3: 64 MHz / (63999+1) = 1000 Гц; 2000 отсчётов = 2 с. */
+            /* TIM3: 64 MHz / (63999+1) = 1000 Гц; 3000 отсчётов = 3 с. */
             (void)HAL_TIM_Base_Stop_IT(&htim3);
             __HAL_TIM_SET_AUTORELOAD(&htim3, BDBG_RESPONSE_TIMEOUT_MS - 1U);
             __HAL_TIM_SET_COUNTER(&htim3, 0U);
@@ -3074,103 +3362,385 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             logger->state = BDBG_PROC;
             break;
         }
+							
 
         case BDBG_PROC:
-        {
-            BDBG_RxStatus rx = BDBG_GetRxStatus();
-            if (rx == BDBG_RX_WAIT) break;
-            (void)HAL_TIM_Base_Stop_IT(&htim3);
-            device_timeout = 0U;
-            logger->dev_type = DEV_NONE;
-            uint8_t ok = (rx == BDBG_RX_READY) &&
-                         BDBG_ParseResponse(logger->bdbg_request, &logger->bdbg_data);
-            BDBG_StopReceive();
-            if (!ok)
-            {
-                if (logger->req_mode == MODE_TEST)
-                {
-                    (void)RadioLine_SendPacket(7U, NULL, 0U);
-                    logger->state = COMMAND_INFO;
-                }
-                else logger->state = BDBG_ERROR_PROC;
-                break;
-            }
-            logger->bdbg_error_counter = 0U;
-            if (logger->req_mode == MODE_TEST)
-            {
-                (void)RadioLine_SendPacket(9U, NULL, 0U);
-                logger->state = REQ_BATTERY;
-                break;
-            }
-            if (logger->req_mode != MODE_WORK) { logger->state = COMMAND_INFO; break; }
-            switch (logger->bdbg_request)
-            {
-                case PAED_REQ:
-                    HAL_Delay(50U);
-                    logger->bdbg_request = TEMP_REQ;
-                    logger->state = REQ_BDBG;
-                    break;
-                case TEMP_REQ:
-                    logger->state = REQ_BATTERY;
-                    break;
-                case START_SPECTRE_REQ:
-                    memset(logger->spectre_arr, 0, sizeof(logger->spectre_arr));
-                    logger->bdbg_spectrum_active = 1U;
-                    logger->bdbg_spectrum_started_s = rtc_seconds;
-                    logger->bdbg_last_poll_s = rtc_seconds;
-                    logger->work_mode = MODE_SPECTRE;
-                    logger->bdbg_request = GET_SPECTRE_REQ;
-                    logger->state = COMMAND_INFO;
-                    break;
-                case GET_SPECTRE_REQ:
-                {
-                    uint8_t near_limit = 0U;
-                    for (uint16_t i = 0U; i < BDBG_SPECTRUM_CHANNELS; ++i)
-                    {
-                        uint32_t sum = (uint32_t)logger->spectre_arr[i] +
-                                       (uint32_t)logger->bdbg_data.spectrum[i];
-                        /* Saturation avoids uint16_t wraparound on unexpected bursts. */
-                        if (sum > UINT16_MAX) sum = UINT16_MAX;
-                        logger->spectre_arr[i] = (uint16_t)sum;
-                        if (sum >= 55705U) near_limit = 1U;
-                    }
-                    logger->bdbg_last_poll_s = rtc_seconds;
-                    /* Завершение и отправка спектра пока НЕ реализованы:
-                     * требуется отдельная интеграция с протоколом RadioLine/SD. */
-                    (void)near_limit;
-                    logger->state = COMMAND_INFO;
-                    break;
-                }
-                default: logger->state = COMMAND_INFO; break;
-            }
-            break;
-        }
+				{
+						/*
+						 * Получаем текущее состояние DMA-приёма БДБГ.
+						 *
+						 * Пока полный ответ не получен и ошибка UART
+						 * не зарегистрирована, остаёмся в BDBG_PROC.
+						 */
+						BDBG_RxStatus rx = BDBG_GetRxStatus();
+
+						if (rx == BDBG_RX_WAIT)
+						{
+								break;
+						}
+
+						/*
+						 * Ответ получен либо зарегистрирована ошибка.
+						 * Останавливаем контроль времени и приём UART4.
+						 */
+						(void)HAL_TIM_Base_Stop_IT(&htim3);
+						device_timeout = 0U;
+						logger->dev_type = DEV_NONE;
+
+						/*
+						 * Проверяем полноту ответа, формат и CRC.
+						 */
+						uint8_t ok =
+								(rx == BDBG_RX_READY) &&
+								BDBG_ParseResponse(
+										logger->bdbg_request,
+										&logger->bdbg_data
+								);
+
+						BDBG_StopReceive();
+
+						/*
+						 * Некорректный ответ или ошибка UART.
+						 */
+						if (ok == 0U)
+						{
+								if (logger->req_mode == MODE_TEST)
+								{
+										/*
+										 * ID07 — некорректный ответ БДБГ
+										 * во время предполётной проверки.
+										 */
+										(void)RadioLine_SendPacket(7U, NULL, 0U);
+										logger->state = COMMAND_INFO;
+								}
+								else
+								{
+										/*
+										 * В рабочем режиме ошибка учитывается
+										 * общим механизмом BDBG_ERROR_PROC.
+										 */
+										logger->state = BDBG_ERROR_PROC;
+								}
+
+								break;
+						}
+
+						/*
+						 * Успешный ответ прерывает последовательность ошибок.
+						 */
+						logger->bdbg_error_counter = 0U;
+
+						/*
+						 * Предполётная проверка БДБГ.
+						 */
+						if (logger->req_mode == MODE_TEST)
+						{
+								(void)RadioLine_SendPacket(9U, NULL, 0U);
+								logger->state = REQ_BATTERY;
+								break;
+						}
+
+						/*
+						 * В остальных режимах, кроме MODE_WORK,
+						 * обычная обработка БДБГ не выполняется.
+						 */
+						if (logger->req_mode != MODE_WORK)
+						{
+								logger->state = COMMAND_INFO;
+								break;
+						}
+
+						switch (logger->bdbg_request)
+						{
+								case PAED_REQ:
+								{
+										/*
+										 * Проверяем назначение PAED_REQ.
+										 *
+										 * Если выполняется остановка спектра,
+										 * успешный ответ означает завершение
+										 * процедуры остановки прибора.
+										 *
+										 * Полученные ПАЕД и статус не используются
+										 * для обычного цикла измерений.
+										 */
+										if (logger->bdbg_spectrum_stopping != 0U)
+										{
+												/*
+												 * Переходим к сохранению накопленного спектра.
+												 *
+												 * Признаки спектрального режима пока
+												 * не сбрасываем: они понадобятся WORK_SD.
+												 */
+												logger->state = WORK_SD;
+												break;
+										}
+
+										/*
+										 * Обычный запрос ПАЕД.
+										 * После паузы 50 мс запрашиваем температуру.
+										 */
+										HAL_Delay(50U);
+										logger->bdbg_request = TEMP_REQ;
+										logger->state = REQ_BDBG;
+										break;
+								}
+
+								case TEMP_REQ:
+								{
+										/*
+										 * Температура уже сохранена
+										 * функцией BDBG_ParseResponse().
+										 */
+										logger->state = REQ_BATTERY;
+										break;
+								}
+
+								case START_SPECTRE_REQ:
+								{
+										/*
+										 * Прибор подтвердил начало набора.
+										 * Обнуляем накопленный спектр LOGGER.
+										 */
+										memset(
+												logger->spectre_arr,
+												0,
+												sizeof(logger->spectre_arr)
+										);
+
+										logger->bdbg_spectrum_active = 1U;
+										logger->bdbg_spectrum_stopping = 0U;
+
+										/*
+										 * Фиксируем время начала набора
+										 * и отсчёта первого пятитисекундного интервала.
+										 */
+										logger->bdbg_spectrum_started_s = rtc_seconds;
+										logger->bdbg_last_poll_s = rtc_seconds;
+
+										logger->work_mode = MODE_SPECTRE;
+										logger->bdbg_request = GET_SPECTRE_REQ;
+										logger->state = COMMAND_INFO;
+										break;
+								}
+
+								case GET_SPECTRE_REQ:
+								{
+										/*
+										 * Максимальное накопленное значение
+										 * среди всех 1024 каналов.
+										 */
+										uint16_t max_channel_value = 0U;
+
+										/*
+										 * Каждая новая порция спектра содержит
+										 * 1024 значения uint16_t.
+										 *
+										 * Эти значения прибавляем к накопленному
+										 * спектру LOGGER.
+										 */
+										for (uint16_t i = 0U;
+												 i < BDBG_SPECTRUM_CHANNELS;
+												 ++i)
+										{
+												/*
+												 * Промежуточная сумма вычисляется
+												 * в uint32_t для защиты от переполнения.
+												 */
+												uint32_t sum =
+														(uint32_t)logger->spectre_arr[i] +
+														(uint32_t)logger->bdbg_data.spectrum[i];
+
+												/*
+												 * Ограничиваем результат UINT16_MAX.
+												 */
+												if (sum > UINT16_MAX)
+												{
+														sum = UINT16_MAX;
+												}
+
+												logger->spectre_arr[i] = (uint16_t)sum;
+
+												/*
+												 * Находим максимальный канал.
+												 */
+												if (logger->spectre_arr[i] > max_channel_value)
+												{
+														max_channel_value = logger->spectre_arr[i];
+												}
+										}
+
+										/*
+										 * Фиксируем время завершения обработки порции.
+										 */
+																		logger->bdbg_last_poll_s = rtc_seconds;
+
+                                        /*
+                                         * ID23: передаём НОВУЮ порцию спектра,
+                                         * а не накопленный spectre_arr[].
+                                         * 2048 байт каналов + 2 времени +
+                                         * 4 ПАЕД + 1 статус = 2055 байт.
+                                         * Статический буфер не расходует стек.
+                                         */
+                                        static uint8_t spectrum_payload[2055U];
+                                        for (uint16_t channel = 0U;
+                                             channel < BDBG_SPECTRUM_CHANNELS;
+                                             ++channel)
+                                        {
+                                            uint16_t value = logger->bdbg_data.spectrum[channel];
+                                            spectrum_payload[2U * channel] =
+                                                (uint8_t)(value & 0xFFU);
+                                            spectrum_payload[2U * channel + 1U] =
+                                                (uint8_t)((value >> 8U) & 0xFFU);
+                                        }
+                                        spectrum_payload[2048U] =
+                                            (uint8_t)(logger->bdbg_data.acquisition_time & 0xFFU);
+                                        spectrum_payload[2049U] =
+                                            (uint8_t)((logger->bdbg_data.acquisition_time >> 8U) & 0xFFU);
+                                        /* STM32L4: IEEE-754 float, Little Endian. */
+                                        memcpy(&spectrum_payload[2050U],
+                                               &logger->bdbg_data.paed_usv_h,
+                                               sizeof(float));
+                                        spectrum_payload[2054U] = logger->bdbg_data.status;
+                                        (void)RadioLine_SendPacket(23U, spectrum_payload, 2055U);
+
+								/*
+								 * Проверяем порог 85% от UINT16_MAX.
+										 *
+										 * 65535 * 0.85 = 55704.75.
+										 *
+										 * При достижении 55705 прекращаем
+										 * дальнейшее накопление и отправляем
+										 * PAED_REQ для остановки БДБГ.
+										 */
+										if (max_channel_value >= 55705U)
+										{
+												logger->bdbg_spectrum_stopping = 1U;
+												logger->bdbg_request = PAED_REQ;
+												logger->state = REQ_BDBG;
+												break;
+										}
+
+										/*
+										 * Порог не достигнут.
+										 * Продолжаем спектральный режим.
+										 */
+										logger->state = COMMAND_INFO;
+										break;
+								}
+
+								default:
+								{
+										logger->state = COMMAND_INFO;
+										break;
+								}
+						}
+
+						break;
+				}	
 
         case BDBG_ERROR_PROC:
-        {
-            (void)HAL_TIM_Base_Stop_IT(&htim3);
-            BDBG_StopReceive();
-            device_timeout = 0U;
-            logger->dev_type = DEV_NONE;
-            if (logger->req_mode == MODE_WORK)
-            {
-                if (logger->bdbg_error_counter < UINT8_MAX) logger->bdbg_error_counter++;
-                if (logger->bdbg_error_counter >= LOGGER_DEVICE_ERROR_LIMIT)
-                {
-                    (void)RadioLine_SendPacket(10U, NULL, 0U);
-                    logger->req_mode = MODE_ERROR;
-                }
-            }
-            logger->state = COMMAND_INFO;
-            break;
-        }
+				{
+						/*
+						 * Завершаем возможный незаконченный обмен
+						 * с БДБГ-15.
+						 */
+						(void)HAL_TIM_Base_Stop_IT(&htim3);
+						BDBG_StopReceive();
+
+						device_timeout = 0U;
+						logger->dev_type = DEV_NONE;
+
+						/*
+						 * Ошибки БДБГ учитываются только
+						 * в рабочем режиме.
+						 */
+						if (logger->req_mode == MODE_WORK)
+						{
+								/*
+								 * Увеличиваем счётчик последовательных ошибок
+								 * с защитой от переполнения uint8_t.
+								 */
+								if (logger->bdbg_error_counter < UINT8_MAX)
+								{
+										logger->bdbg_error_counter++;
+								}
+
+								/*
+								 * Проверяем достижение допустимого
+								 * количества последовательных ошибок.
+								 */
+								if (logger->bdbg_error_counter >= LOGGER_DEVICE_ERROR_LIMIT)
+								{
+										/*
+										 * ID10 — БДБГ вышел из строя,
+										 * радиационная разведка невозможна.
+										 */
+										(void)RadioLine_SendPacket(10U, NULL, 0U);
+
+										logger->req_mode = MODE_ERROR;
+
+										/*
+										 * Если ошибка произошла во время
+										 * завершающего PAED_REQ, накопленный
+										 * спектр всё равно необходимо сохранить.
+										 */
+										if (logger->bdbg_spectrum_stopping != 0U)
+										{
+												logger->state = WORK_SD;
+										}
+										else
+										{
+												logger->state = COMMAND_INFO;
+										}
+
+										break;
+								}
+
+								/*
+								 * Если процедура остановки спектра уже началась,
+								 * а лимит ошибок ещё не исчерпан,
+								 * повторяем завершающий PAED_REQ.
+								 */
+								if (logger->bdbg_spectrum_stopping != 0U)
+								{
+										logger->bdbg_request = PAED_REQ;
+										logger->state = REQ_BDBG;
+										break;
+								}
+						}
+
+						/*
+						 * Обычная обработка ошибок БДБГ:
+						 * возвращаемся к ожиданию команд.
+						 */
+						logger->state = COMMAND_INFO;
+						break;
+				}
 
         case REQ_BATTERY:
         case BATTERY_PROC:
         case BATTERY_ERROR_PROC:
+        {
+            /* Заглушка обработки аккумулятора. */
+            break;
+        }
 
         case WORK_SD:
         {
+            /*
+             * Заглушка SD: итоговый spectre_arr[] остаётся в RAM.
+             * Запись на SD будет добавлена позднее.
+             */
+            if (logger->bdbg_spectrum_stopping != 0U)
+            {
+                logger->bdbg_spectrum_active = 0U;
+                logger->bdbg_spectrum_stopping = 0U;
+                logger->bdbg_request = PAED_REQ;
+                logger->work_mode = logger->old_work_mode;
+                LoggerStateMachine_StopInterval(logger);
+                logger->state = COMMAND_INFO;
+            }
             break;
         }
 
