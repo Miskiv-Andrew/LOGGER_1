@@ -2861,11 +2861,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										gps_payload,
 										sizeof(gps_payload));
 
-								/*
-								 * Здесь должна выполняться запись
-								 * пакета № 5 на SD-карту.
-								 */
-
 								logger->dev_type = DEV_NONE;
 								logger->state = COMMAND_INFO;
 

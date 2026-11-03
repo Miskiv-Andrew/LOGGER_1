@@ -424,6 +424,16 @@
               <FileType>5</FileType>
               <FilePath>..\Inc\bdbg_protocol.h</FilePath>
             </File>
+            <File>
+              <FileName>sd_logger.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Inc\sd_logger.h</FilePath>
+            </File>
+            <File>
+              <FileName>sd_logger.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\sd_logger.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
