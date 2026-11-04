@@ -275,9 +275,17 @@ void SD_Logger_SetMountResult(FRESULT result)
     }
 }
 
-
 /*
- * Создание файла для нового FlightConfig.
+ * ============================================================
+ * Создание нового CSV-файла для FlightConfig.
+ *
+ * Каталог: 0:/YYMMDD
+ * Файл:    HHMMSS.CSV
+ *
+ * ВАЖНО:
+ * Используем FA_CREATE_NEW, чтобы никогда
+ * не перезаписывать существующий файл.
+ * ============================================================
  */
 SD_LoggerResult SD_Logger_OpenFlight(
     uint8_t year,
@@ -293,7 +301,7 @@ SD_LoggerResult SD_Logger_OpenFlight(
      *
      * 0:/YYMMDD
      *
-     * Нулевой символ завершает строку.
+     * Последний символ строки — '\0'.
      */
     char directory[10] = "0:/000000";
 
@@ -307,7 +315,8 @@ SD_LoggerResult SD_Logger_OpenFlight(
     FRESULT result;
 
     /*
-     * Если SD-карта отключена, ничего не делаем.
+     * Если запись на SD-карту отключена,
+     * создание файла не выполняем.
      */
     if (write_card_flag == 0U)
     {
@@ -315,10 +324,10 @@ SD_LoggerResult SD_Logger_OpenFlight(
     }
 
     /*
-     * Проверяем дату и время.
+     * Проверяем диапазоны даты и времени.
      *
-     * Проверка календарной корректности даты
-     * выполняется модулем RTC.
+     * Полную календарную проверку даты
+     * выполняет модуль RTC.
      */
     if (year > 99U ||
         month < 1U || month > 12U ||
@@ -331,15 +340,21 @@ SD_LoggerResult SD_Logger_OpenFlight(
     }
 
     /*
-     * Если предыдущий файл открыт,
+     * Если предыдущий CSV-файл открыт,
      * сначала закрываем его.
      *
-     * Это необходимо при получении нового FlightConfig.
+     * Это необходимо при получении
+     * нового корректного FlightConfig.
      */
     if (sd_file_open != 0U)
     {
-        SD_LoggerResult close_result = SD_Logger_Close();
+        SD_LoggerResult close_result =
+            SD_Logger_Close();
 
+        /*
+         * При ошибке закрытия предыдущего
+         * файла новый файл не открываем.
+         */
         if (close_result != SD_LOGGER_OK)
         {
             return close_result;
@@ -347,74 +362,139 @@ SD_LoggerResult SD_Logger_OpenFlight(
     }
 
     /*
-     * Формируем имя каталога YYMMDD.
+     * ========================================================
+     * Формирование каталога YYMMDD.
+     * ========================================================
      */
-    SD_Logger_WriteTwoDigits(&directory[3], year);
-    SD_Logger_WriteTwoDigits(&directory[5], month);
-    SD_Logger_WriteTwoDigits(&directory[7], day);
+
+    SD_Logger_WriteTwoDigits(
+        &directory[3], year
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &directory[5], month
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &directory[7], day
+    );
 
     /*
-     * Формируем полный путь.
+     * ========================================================
+     * Формирование полного имени файла.
+     * ========================================================
      *
-     * Дата располагается в позициях 3..8.
+     * 0:/YYMMDD/HHMMSS.CSV
      */
-    SD_Logger_WriteTwoDigits(&filename[3], year);
-    SD_Logger_WriteTwoDigits(&filename[5], month);
-    SD_Logger_WriteTwoDigits(&filename[7], day);
 
     /*
-     * Время располагается в позициях 10..15.
+     * Дата: позиции 3–8.
      */
-    SD_Logger_WriteTwoDigits(&filename[10], hour);
-    SD_Logger_WriteTwoDigits(&filename[12], minute);
-    SD_Logger_WriteTwoDigits(&filename[14], second);
+    SD_Logger_WriteTwoDigits(
+        &filename[3], year
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &filename[5], month
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &filename[7], day
+    );
 
     /*
-     * Создаём каталог.
+     * Время: позиции 10–15.
+     */
+    SD_Logger_WriteTwoDigits(
+        &filename[10], hour
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &filename[12], minute
+    );
+
+    SD_Logger_WriteTwoDigits(
+        &filename[14], second
+    );
+
+    /*
+     * ========================================================
+     * Создание каталога.
+     * ========================================================
+     *
+     * FR_OK:
+     * каталог успешно создан.
+     *
+     * FR_EXIST:
+     * каталог уже существует.
+     * Это нормальная ситуация.
      */
     result = f_mkdir(directory);
 
-    /*
-     * FR_EXIST означает, что каталог уже существует.
-     * Это нормальная ситуация.
-     */
     if (result != FR_OK && result != FR_EXIST)
     {
+        /*
+         * Регистрируем ошибку FatFs.
+         *
+         * SD_Logger_SetError() отключает запись
+         * и устанавливает событие ошибки SD.
+         */
         SD_Logger_SetError(result);
 
         return SD_LOGGER_ERROR;
     }
 
     /*
-     * Открываем новый файл.
+     * ========================================================
+     * Создание нового CSV-файла.
+     * ========================================================
      *
-     * FA_WRITE        — разрешаем запись.
-     * FA_CREATE_ALWAYS — создаём файл заново.
+     * FA_WRITE:
+     * разрешаем запись.
      *
-     * При совпадении имени существующий файл
-     * будет перезаписан.
+     * FA_CREATE_NEW:
+     * создаём только новый файл.
+     *
+     * Если файл уже существует, FatFs
+     * возвращает FR_EXIST.
+     *
+     * Существующий файл не изменяется.
      */
     result = f_open(
         &sd_file,
         filename,
-        FA_WRITE | FA_CREATE_ALWAYS
+        FA_WRITE | FA_CREATE_NEW
     );
 
+    /*
+     * Проверяем результат создания файла.
+     */
     if (result != FR_OK)
     {
+        /*
+         * В том числе обрабатываем FR_EXIST.
+         *
+         * Регистрируем ошибку SD.
+         * Запись будет отключена.
+         *
+         * При этом существующий CSV-файл
+         * останется без изменений.
+         */
         SD_Logger_SetError(result);
 
         return SD_LOGGER_ERROR;
     }
 
     /*
-     * Файл успешно открыт.
+     * ========================================================
+     * Файл успешно создан и открыт.
+     * ========================================================
      */
+
     sd_file_open = 1U;
 
     return SD_LOGGER_OK;
 }
-
 
 /*
  * Запись одного пакета в CSV.

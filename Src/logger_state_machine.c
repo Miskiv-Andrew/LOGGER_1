@@ -12,6 +12,7 @@
 #include "lidar.h"
 #include "bdbg.h"
 #include "bdbg_config.h"
+#include "sd_logger.h"
 
 /*
  * Статический буфер для формирования пакетов RadioLine.
@@ -115,6 +116,493 @@ static HAL_StatusTypeDef RadioLine_SendPacket(uint8_t packet_id, const uint8_t *
  * Динамическую память не используем.
  */
 static uint8_t radioline_spectrum_payload[ RADIOLINE_SPECTRUM_PAYLOAD_SIZE ];
+
+
+/*
+ * Размер полезной нагрузки радиопакета ID27.
+ *
+ * Дата и время:        10 байт ASCII.
+ * Номер спектра:        2 байта uint16_t.
+ * Широта:               4 байта float.
+ * Долгота:              4 байта float.
+ * Высота LIDAR:         2 байта uint16_t.
+ *
+ * Итого: 22 байта.
+ */
+#define RADIOLINE_SPECTRUM_START_PAYLOAD_SIZE 22U
+
+
+
+/*
+ * Размер полезной нагрузки итогового спектра ID23.
+ *
+ * 10 байт — дата и время ASCII;
+ *  2 байта — номер спектра;
+ *  4 байта — широта GPS;
+ *  4 байта — долгота GPS;
+ *  2 байта — высота LIDAR;
+ * 2048 байт — 1024 канала спектра.
+ *
+ * Всего: 2070 байт.
+ */
+#define SD_SPECTRUM_PAYLOAD_SIZE 2070U
+
+/*
+ * Статический буфер полного накопленного спектра.
+ *
+ * Не размещаем массив размером 2070 байт на стеке.
+ * Динамическая память не используется.
+ */
+static uint8_t sd_spectrum_payload[SD_SPECTRUM_PAYLOAD_SIZE];
+
+
+/*
+ * Формирует и записывает итоговый накопленный
+ * спектр в открытый CSV-файл SD-карты.
+ *
+ * Формат полезной нагрузки полностью соответствует
+ * согласованному формату ID23 для SD.
+ *
+ * Функция не передаёт данные по RadioLine.
+ * Функция не изменяет состояние стейт-машины.
+ */
+static SD_LoggerResult SD_WriteAccumulatedSpectrum(
+    const LoggerStateMachine *logger)
+{
+    /*
+     * Проверяем указатель на структуру LOGGER.
+     */
+    if (logger == NULL)
+    {
+        return SD_LOGGER_INVALID_ARGUMENT;
+    }
+
+    /*
+     * Проверяем наличие зафиксированных
+     * координат GPS и высоты LIDAR.
+     */
+    if (logger->spectrum_start_data_valid == 0U)
+    {
+        return SD_LOGGER_INVALID_ARGUMENT;
+    }
+
+    /*
+     * Проверяем разрешение записи на SD-карту.
+     */
+    if (SD_Logger_IsEnabled() == 0U)
+    {
+        return SD_LOGGER_DISABLED;
+    }
+
+    /*
+     * Проверяем, что файл полёта открыт.
+     */
+    if (SD_Logger_IsFileOpen() == 0U)
+    {
+        return SD_LOGGER_NO_FILE;
+    }
+
+    /*
+     * Получаем зафиксированную дату и время
+     * начала набора спектра.
+     */
+    const GPS_TimeStamp *time =
+        &logger->spectrum_start_time;
+
+    /*
+     * Подготавливаем дату и время:
+     *
+     * YYMMDDHHMM
+     *
+     * Каждое поле представлено двумя
+     * ASCII-символами.
+     */
+    const uint8_t values[5] =
+    {
+        (uint8_t)(time->year % 100U),
+        time->month,
+        time->day,
+        time->hour,
+        time->minute
+    };
+
+    /*
+     * Заполняем байты 0–9.
+     */
+    for (uint8_t i = 0U; i < 5U; ++i)
+    {
+        sd_spectrum_payload[2U * i] =
+            (uint8_t)('0' + values[i] / 10U);
+
+        sd_spectrum_payload[2U * i + 1U] =
+            (uint8_t)('0' + values[i] % 10U);
+    }
+
+    /*
+     * Байты 10–11:
+     * порядковый номер спектра.
+     *
+     * uint16_t, Little Endian.
+     */
+    const uint16_t sequence =
+        logger->spectrum_sequence_number;
+
+    sd_spectrum_payload[10] =
+        (uint8_t)(sequence & 0xFFU);
+
+    sd_spectrum_payload[11] =
+        (uint8_t)((sequence >> 8U) & 0xFFU);
+
+    /*
+     * Байты 12–15:
+     * широта GPS, float IEEE-754.
+     */
+    memcpy(
+        &sd_spectrum_payload[12],
+        &logger->spectrum_start_coord.lat,
+        sizeof(float)
+    );
+
+    /*
+     * Байты 16–19:
+     * долгота GPS, float IEEE-754.
+     */
+    memcpy(
+        &sd_spectrum_payload[16],
+        &logger->spectrum_start_coord.lon,
+        sizeof(float)
+    );
+
+    /*
+     * Байты 20–21:
+     * высота LIDAR в сантиметрах.
+     *
+     * uint16_t, Little Endian.
+     */
+    const uint16_t height =
+        logger->spectrum_start_height_cm;
+
+    sd_spectrum_payload[20] =
+        (uint8_t)(height & 0xFFU);
+
+    sd_spectrum_payload[21] =
+        (uint8_t)((height >> 8U) & 0xFFU);
+
+    /*
+     * Байты 22–2069:
+     * накопленный спектр LOGGER.
+     *
+     * 1024 канала по 2 байта.
+     *
+     * Каждый канал передаётся в Little Endian:
+     * младший байт, затем старший.
+     */
+    for (uint16_t channel = 0U;
+         channel < BDBG_SPECTRUM_CHANNELS;
+         ++channel)
+    {
+        const uint16_t value =
+            logger->spectre_arr[channel];
+
+        const uint16_t offset =
+            (uint16_t)(22U + 2U * channel);
+
+        sd_spectrum_payload[offset] =
+            (uint8_t)(value & 0xFFU);
+
+        sd_spectrum_payload[offset + 1U] =
+            (uint8_t)((value >> 8U) & 0xFFU);
+    }
+
+    /*
+     * Записываем итоговый спектр на SD.
+     *
+     * ID23 передаётся десятичным числом 23.
+     * SD_Logger_WritePacket() преобразует его
+     * в HEX "17".
+     *
+     * Эта же функция преобразует каждый байт
+     * полезной нагрузки в HEX, добавляет запятые
+     * и выполняет f_sync().
+     *
+     * Результат возвращаем вызывающему коду
+     * для последующей обработки.
+     */
+    return SD_Logger_WritePacket(
+        23U,
+        sd_spectrum_payload,
+        SD_SPECTRUM_PAYLOAD_SIZE
+    );
+}
+
+
+
+/*
+ * ============================================================
+ * Открытие CSV-файла для нового FlightConfig.
+ *
+ * Вызывается только после успешной проверки ID04.
+ *
+ * Время берём из RTC. При ошибке чтения RTC
+ * используем последнее сохранённое время GPS/RTC.
+ *
+ * Ошибки SD не меняют состояние LOGGER.
+ * ============================================================
+ */
+static void SD_OpenFlightFile(LoggerStateMachine *logger)
+{
+    GPS_TimeStamp flight_time = {0};
+
+    /*
+     * Проверяем указатель.
+     */
+    if (logger == NULL)
+    {
+        return;
+    }
+
+    /*
+     * Если SD отключена, не пытаемся
+     * создавать новый файл.
+     */
+    if (SD_Logger_IsEnabled() == 0U)
+    {
+        return;
+    }
+
+    /*
+     * Начальное значение — последнее время,
+     * сохранённое в структуре LOGGER.
+     */
+    flight_time = logger->gps_data.current_rtc_time;
+
+    /*
+     * Пытаемся получить актуальное время RTC.
+     */
+    GPS_TimeStamp current_time = {0};
+
+    if (RTC_Service_GetTime(&current_time) == HAL_OK)
+    {
+        flight_time = current_time;
+
+        /*
+         * Обновляем сохранённое время,
+         * чтобы оно было доступно при
+         * последующей ошибке чтения RTC.
+         */
+        logger->gps_data.current_rtc_time = current_time;
+    }
+
+    /*
+     * Создаём файл:
+     *
+     * 0:/YYMMDD/HHMMSS.CSV
+     *
+     * SD_Logger_OpenFlight():
+     * - закрывает предыдущий открытый файл;
+     * - создаёт каталог даты;
+     * - создаёт новый файл без перезаписи;
+     * - регистрирует ошибки FatFs.
+     *
+     * Год GPS_TimeStamp хранится полностью
+     * (например, 2026), поэтому берём
+     * последние две цифры.
+     */
+    SD_LoggerResult result = SD_Logger_OpenFlight(
+        (uint8_t)(flight_time.year % 100U),
+        flight_time.month,
+        flight_time.day,
+        flight_time.hour,
+        flight_time.minute,
+        flight_time.second
+    );
+
+    /*
+     * Ошибка SD не должна прерывать
+     * выполнение FlightConfig.
+     *
+     * Состояние стейт-машины не изменяем.
+     * Ошибки FatFs обрабатывает sd_logger.
+     */
+    (void)result;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+/*
+ * Формирование и передача радиопакета ID27.
+ *
+ * Пакет содержит данные начала набора спектра.
+ * Вызывается после успешного подтверждения
+ * команды START_SPECTRE_REQ прибором БДБГ-15.
+ *
+ * Формат полезной нагрузки (22 байта):
+ *
+ *  0–1   Год (YY), ASCII
+ *  2–3   Месяц (MM), ASCII
+ *  4–5   День (DD), ASCII
+ *  6–7   Часы (HH), ASCII
+ *  8–9   Минуты (MM), ASCII
+ * 10–11  Порядковый номер спектра, uint16_t
+ * 12–15  Широта GPS, float
+ * 16–19  Долгота GPS, float
+ * 20–21  Высота LIDAR, uint16_t (сантиметры)
+ *
+ * Все бинарные числовые поля передаются
+ * в формате Little Endian.
+ *
+ * Функция не изменяет состояние стейт-машины
+ * и не записывает данные на SD-карту.
+ */
+static HAL_StatusTypeDef RadioLine_SendSpectrumStart(
+    const LoggerStateMachine *logger)
+{
+    /*
+     * Локальный буфер полезной нагрузки.
+     *
+     * Размер определён константой:
+     * RADIOLINE_SPECTRUM_START_PAYLOAD_SIZE = 22.
+     */
+    uint8_t payload[RADIOLINE_SPECTRUM_START_PAYLOAD_SIZE];
+
+    /*
+     * Проверяем указатель на структуру LOGGER
+     * и наличие зафиксированных GPS/LIDAR данных.
+     */
+    if ((logger == NULL) ||
+        (logger->spectrum_start_data_valid == 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * Получаем дату и время начала набора спектра.
+     *
+     * Время должно быть предварительно сохранено
+     * из RTC в spectrum_start_time.
+     */
+    const GPS_TimeStamp *time =
+        &logger->spectrum_start_time;
+
+    /*
+     * Подготавливаем пять числовых полей даты
+     * и времени для преобразования в ASCII:
+     *
+     * YY, MM, DD, HH, MM.
+     *
+     * Полный год (например, 2026)
+     * преобразуется в последние две цифры (26).
+     */
+    const uint8_t values[5] =
+    {
+        (uint8_t)(time->year % 100U),
+        time->month,
+        time->day,
+        time->hour,
+        time->minute
+    };
+
+    /*
+     * Преобразуем каждое значение в два
+     * ASCII-символа с ведущим нулём.
+     *
+     * Например:
+     *  3 -> '0', '3'
+     * 26 -> '2', '6'
+     */
+    for (uint8_t i = 0U; i < 5U; ++i)
+    {
+        payload[2U * i] =
+            (uint8_t)('0' + values[i] / 10U);
+
+        payload[2U * i + 1U] =
+            (uint8_t)('0' + values[i] % 10U);
+    }
+
+    /*
+     * Байты 10–11:
+     * порядковый номер спектра.
+     *
+     * uint16_t, Little Endian:
+     * сначала младший байт, затем старший.
+     */
+    const uint16_t sequence =
+        logger->spectrum_sequence_number;
+
+    payload[10] =
+        (uint8_t)(sequence & 0xFFU);
+
+    payload[11] =
+        (uint8_t)((sequence >> 8U) & 0xFFU);
+
+    /*
+     * Байты 12–15:
+     * широта GPS в десятичных градусах.
+     *
+     * Тип float, IEEE-754, Little Endian.
+     *
+     * В структуре Coord поле широты называется lat.
+     */
+    memcpy(
+        &payload[12],
+        &logger->spectrum_start_coord.lat,
+        sizeof(float)
+    );
+
+    /*
+     * Байты 16–19:
+     * долгота GPS в десятичных градусах.
+     *
+     * Тип float, IEEE-754, Little Endian.
+     *
+     * В структуре Coord поле долготы называется lon.
+     */
+    memcpy(
+        &payload[16],
+        &logger->spectrum_start_coord.lon,
+        sizeof(float)
+    );
+
+    /*
+     * Байты 20–21:
+     * высота LIDAR в сантиметрах.
+     *
+     * Тип uint16_t, Little Endian.
+     */
+    const uint16_t height =
+        logger->spectrum_start_height_cm;
+
+    payload[20] =
+        (uint8_t)(height & 0xFFU);
+
+    payload[21] =
+        (uint8_t)((height >> 8U) & 0xFFU);
+
+    /*
+     * Передаём сформированный пакет ID27
+     * через существующий механизм RadioLine.
+     *
+     * Обрамление и контрольная сумма
+     * формируются функцией RadioLine_SendPacket().
+     */
+    return RadioLine_SendPacket(
+        27U,
+        payload,
+        RADIOLINE_SPECTRUM_START_PAYLOAD_SIZE
+    );
+}
 
 
 /*
@@ -1182,18 +1670,6 @@ static uint8_t LoggerStateMachine_ProcessRtcInterval(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 /* ============================================================================
  * Инициализация стейт-машины LOGGER.
  *
@@ -1452,8 +1928,19 @@ void LoggerStateMachine_Init(LoggerStateMachine *logger)
 		*/
     logger->spectrum_start_coord = (Coord){0};
     logger->spectrum_start_height_cm = 0U;
-    logger->spectrum_start_data_valid = 0U;					
-				
+    logger->spectrum_start_data_valid = 0U;		
+
+		/*
+		 * Порядковый номер спектра.
+		 * При запуске LOGGER счётчик обнуляется.
+		 */
+		logger->spectrum_sequence_number = 0U;
+
+		/*
+		 * Дата и время начала набора спектра.
+		 * Будут заполнены после подтверждения START_SPECTRE_REQ.
+		 */
+		logger->spectrum_start_time = (GPS_TimeStamp){0};						
 }
 
 
@@ -2699,10 +3186,11 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										if (logger->gps_spoofing_counter >= LOGGER_GPS_SPOOFING_LIMIT)
 										{
 												/*
-												 * ID 27 — "Обнаружен GPS-спуфинг".
+												 * ID24 — зафиксирован GPS-спуфинг.
+												 * Дальнейшая радиационная разведка невозможна.
 												 * Стандартный Payload: 0x01.
 												 */
-												(void)RadioLine_SendPacket(27U, NULL, 0U);
+												(void)RadioLine_SendPacket(24U, NULL, 0U);
 
 												logger->req_mode = MODE_ERROR;
 										}
@@ -2779,22 +3267,70 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 												logger->gps_data.current_coord,
 												&logger->flight_config) != 0U)
 								{
+										
 										/*
-										 * Дрон вошёл в область разведки.
+										 * ========================================================
+										 * Дрон вошёл в область радиационной разведки.
 										 *
-										 * ID 20 — координата и время, в области.
+										 * ID20 — координаты GPS и время входа в область.
+										 *
+										 * Этот участок выполняется в MODE_EXPECT
+										 * при первом обнаружении координаты внутри области.
+										 * ========================================================
+										 */
+
+										/*
+										 * Передаём пакет ID20 на землю по RadioLine.
+										 *
+										 * Формат полезной нагрузки:
+										 *
+										 * Байты 0–3  — latitude, float, Little Endian.
+										 * Байты 4–7  — longitude, float, Little Endian.
+										 * Байт  8    — часы.
+										 * Байт  9    — минуты.
+										 * Байт  10   — секунды.
+										 *
+										 * Всего 11 байт.
 										 */
 										(void)RadioLine_SendPacket(
 												20U,
 												gps_payload,
-												sizeof(gps_payload));
+												sizeof(gps_payload)
+										);
 
 										/*
-										 * Здесь должна выполняться запись
-										 * пакета № 6 на SD-карту.
+										 * ========================================================
+										 * Сохранение ID20 на SD-карту.
+										 * ========================================================
 										 *
-										 * Запись подключим к реализации WORK_SD.
+										 * Записываем тот же пакет, который отправили
+										 * на землю по RadioLine.
+										 *
+										 * Формат строки CSV:
+										 *
+										 * 14,XX,XX,XX,...,XX
+										 *
+										 * 14 — идентификатор ID20 в HEX.
+										 * Далее 11 байт полезной нагрузки.
+										 *
+										 * SD_Logger_WritePacket() самостоятельно:
+										 * - проверяет доступность SD-карты;
+										 * - проверяет наличие открытого CSV-файла;
+										 * - преобразует байты в HEX;
+										 * - разделяет байты запятыми;
+										 * - записывает строку;
+										 * - выполняет f_sync();
+										 * - регистрирует ошибки FatFs.
+										 *
+										 * Ошибка записи не должна препятствовать
+										 * переходу LOGGER в MODE_WORK.
 										 */
+										(void)SD_Logger_WritePacket(
+												20U,
+												gps_payload,
+												(uint16_t)sizeof(gps_payload)
+										);
+
 
 										/*
 										 * Переходим в рабочий режим.
@@ -2814,20 +3350,51 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								}
 								else
 								{
+										
 										/*
-										 * Дрон пока находится вне области разведки.
+										 * Дрон находится вне области разведки.
 										 *
-										 * ID 19 — координата и время, вне области.
+										 * ID19 — координаты GPS и время.
+										 *
+										 * Передаём пакет на землю независимо
+										 * от состояния SD-карты.
 										 */
 										(void)RadioLine_SendPacket(
 												19U,
 												gps_payload,
-												sizeof(gps_payload));
+												sizeof(gps_payload)
+										);
 
 										/*
-										 * Здесь должна выполняться запись
-										 * пакета № 5 на SD-карту.
+										 * Сохраняем тот же пакет ID19 на SD-карту.
+										 *
+										 * Выполняется только в MODE_EXPECT,
+										 * поскольку данный участок находится
+										 * внутри соответствующей ветки.
+										 *
+										 * Формат CSV:
+										 *
+										 * 13,XX,XX,...,XX
+										 *
+										 * 13 — это ID19 в шестнадцатеричном виде.
+										 * Далее 11 байт GPS и времени.
+										 *
+										 * SD_Logger_WritePacket():
+										 * - проверяет разрешение записи;
+										 * - проверяет наличие открытого файла;
+										 * - преобразует байты в HEX;
+										 * - записывает строку CSV;
+										 * - выполняет f_sync();
+										 * - регистрирует ошибки FatFs.
+										 *
+										 * Ошибка SD не должна прерывать
+										 * работу LOGGER или передачу RadioLine.
 										 */
+										(void)SD_Logger_WritePacket(
+												19U,
+												gps_payload,
+												(uint16_t)sizeof(gps_payload)
+										);
 
 										/*
 										 * Возвращаемся к ожиданию следующего
@@ -3490,12 +4057,21 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										logger->state = REQ_BATTERY;
 										break;
 								}
-
+								
 								case START_SPECTRE_REQ:
 								{
 										/*
-										 * Прибор подтвердил начало набора.
+										 * БДБГ-15 успешно подтвердил команду
+										 * начала набора спектра.
+										 *
+										 * С этого момента набор считается начатым.
+										 */
+
+										/*
 										 * Обнуляем накопленный спектр LOGGER.
+										 *
+										 * В массиве spectre_arr[] будет накапливаться
+										 * сумма последующих порций спектра БДБГ-15.
 										 */
 										memset(
 												logger->spectre_arr,
@@ -3503,22 +4079,118 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 												sizeof(logger->spectre_arr)
 										);
 
+										/*
+										 * Устанавливаем признаки активного набора.
+										 *
+										 * Процедура остановки набора сейчас
+										 * не выполняется.
+										 */
 										logger->bdbg_spectrum_active = 1U;
 										logger->bdbg_spectrum_stopping = 0U;
 
 										/*
 										 * Фиксируем время начала набора
-										 * и отсчёта первого пятитисекундного интервала.
+										 * по секундному счётчику LOGGER.
+										 *
+										 * Этот счётчик используется для контроля
+										 * длительности набора и интервалов опроса.
 										 */
 										logger->bdbg_spectrum_started_s = rtc_seconds;
 										logger->bdbg_last_poll_s = rtc_seconds;
 
+										/*
+										 * Получаем дату и время начала набора.
+										 *
+										 * Сначала копируем последнее сохранённое
+										 * время RTC в резервную переменную.
+										 *
+										 * Если новое чтение RTC завершится ошибкой,
+										 * сохранённое время будет использовано
+										 * для идентификатора спектра.
+										 */
+										GPS_TimeStamp spectrum_time =
+												logger->gps_data.current_rtc_time;
+
+										/*
+										 * Пытаемся получить актуальное время RTC.
+										 *
+										 * При успешном чтении обновляем также
+										 * последнее сохранённое время.
+										 *
+										 * При ошибке резервное значение spectrum_time
+										 * остаётся без изменений.
+										 *
+										 * Ошибка RTC не отменяет набор спектра.
+										 */
+										GPS_TimeStamp current_time = {0};
+
+										if (RTC_Service_GetTime(&current_time) == HAL_OK)
+										{
+												spectrum_time = current_time;
+
+												logger->gps_data.current_rtc_time =
+														current_time;
+										}
+
+										/*
+										 * Сохраняем дату и время начала спектра.
+										 *
+										 * Эти данные будут использованы
+										 * при формировании радиопакета ID27
+										 * и последующей записи спектра на SD-карту.
+										 */
+										logger->spectrum_start_time = spectrum_time;
+
+										/*
+										 * Увеличиваем порядковый номер спектра.
+										 *
+										 * После включения LOGGER счётчик равен 0.
+										 * Первый подтверждённый набор получает номер 1.
+										 *
+										 * При достижении UINT16_MAX счётчик
+										 * возвращается к 1, не используя номер 0.
+										 */
+										if (logger->spectrum_sequence_number == UINT16_MAX)
+										{
+												logger->spectrum_sequence_number = 1U;
+										}
+										else
+										{
+												logger->spectrum_sequence_number++;
+										}
+
+										/*
+										 * Передаём радиопакет ID27:
+										 *
+										 * - дата и время начала набора;
+										 * - порядковый номер спектра;
+										 * - GPS-координаты начала набора;
+										 * - высота LIDAR начала набора.
+										 *
+										 * Координаты и высота были зафиксированы
+										 * ранее, перед отправкой START_SPECTRE_REQ.
+										 *
+										 * Ошибка радиопередачи не отменяет
+										 * уже запущенный набор спектра.
+										 *
+										 * Пакет ID27 на SD-карту не записывается.
+										 */
+										(void)RadioLine_SendSpectrumStart(logger);
+
+										/*
+										 * Переходим в режим набора спектра.
+										 *
+										 * Следующий запрос к БДБГ-15:
+										 * GET_SPECTRE_REQ — получение порции спектра.
+										 */
 										logger->work_mode = MODE_SPECTRE;
 										logger->bdbg_request = GET_SPECTRE_REQ;
 										logger->state = COMMAND_INFO;
-										break;
-								}
 
+										break;
+								}								
+
+								
 								case GET_SPECTRE_REQ:
 								{
 										/*
@@ -3719,26 +4391,89 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
         {
             /* Заглушка обработки аккумулятора. */
             break;
-        }
+        }				
+       
+				case WORK_SD:
+				{
+						/*
+						 * Состояние сохранения итогового накопленного
+						 * спектра на SD-карту.
+						 *
+						 * Сюда переходим после завершения набора
+						 * спектра прибором БДБГ-15.
+						 *
+						 * Отдельные порции спектра на SD не записываем.
+						 */
 
-        case WORK_SD:
-        {
-            /*
-             * Заглушка SD: итоговый spectre_arr[] остаётся в RAM.
-             * Запись на SD будет добавлена позднее.
-             */
-            if (logger->bdbg_spectrum_stopping != 0U)
-            {
-                logger->bdbg_spectrum_active = 0U;
-                logger->bdbg_spectrum_stopping = 0U;
-                logger->bdbg_request = PAED_REQ;
-                logger->work_mode = logger->old_work_mode;
-                LoggerStateMachine_StopInterval(logger);
-                logger->state = COMMAND_INFO;
-            }
-            break;
-        }
+						/*
+						 * Проверяем, что выполнялась процедура
+						 * завершения спектрального режима.
+						 */
+						if (logger->bdbg_spectrum_stopping != 0U)
+						{
+								/*
+								 * Записываем полный накопленный спектр.
+								 *
+								 * SD_WriteAccumulatedSpectrum():
+								 * - формирует 2070 байт полезной нагрузки;
+								 * - добавляет дату, номер спектра, GPS, LIDAR;
+								 * - записывает 1024 канала;
+								 * - сохраняет строку CSV с ID23;
+								 * - выполняет f_sync().
+								 *
+								 * Результат записи не должен влиять
+								 * на завершение спектрального режима.
+								 */
+								SD_LoggerResult sd_result =
+										SD_WriteAccumulatedSpectrum(logger);
 
+								/*
+								 * Если SD-карта недоступна или файл
+								 * не открыт, спектр остаётся в RAM.
+								 *
+								 * При ошибке FatFs модуль sd_logger
+								 * самостоятельно отключает запись
+								 * и устанавливает событие ошибки.
+								 *
+								 * Событие будет обработано отдельно
+								 * механизмом контроля SD.
+								 */
+								(void)sd_result;
+
+								/*
+								 * Завершаем спектральный режим независимо
+								 * от результата записи на SD.
+								 */
+								logger->bdbg_spectrum_active = 0U;
+								logger->bdbg_spectrum_stopping = 0U;
+
+								/*
+								 * Возвращаем обычный запрос ПАЕД.
+								 */
+								logger->bdbg_request = PAED_REQ;
+
+								/*
+								 * Восстанавливаем режим работы,
+								 * действовавший до начала набора спектра.
+								 */
+								logger->work_mode = logger->old_work_mode;
+
+								/*
+								 * Останавливаем интервал измерения.
+								 */
+								LoggerStateMachine_StopInterval(logger);
+
+								/*
+								 * Возвращаемся к обработке команд.
+								 */
+								logger->state = COMMAND_INFO;
+						}
+
+						break;
+				}	
+				
+	
+				
         /*
          * Защита от некорректного состояния.
          */
