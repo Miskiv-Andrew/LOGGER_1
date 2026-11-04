@@ -156,6 +156,110 @@ static uint8_t radioline_spectrum_payload[ RADIOLINE_SPECTRUM_PAYLOAD_SIZE ];
 static uint8_t sd_spectrum_payload[SD_SPECTRUM_PAYLOAD_SIZE];
 
 
+
+
+/*
+ * Формирует полезную нагрузку ID22 (данные разведки).
+ *
+ * Размер: 31 байт.
+ * Все многобайтовые значения записываются в Little Endian.
+ *
+ * Функция не отправляет пакет и не записывает SD-карту.
+ * Она только заполняет переданный буфер.
+ */
+#define ID22_PAYLOAD_SIZE 31U
+
+static void Logger_BuildID22Payload(
+    const LoggerStateMachine *logger,
+    uint8_t payload[ID22_PAYLOAD_SIZE])
+{
+    uint16_t value16;
+
+    /* 0–3: ПАЕД, float. */
+    memcpy(&payload[0],
+           &logger->bdbg_data.paed_usv_h,
+           sizeof(float));
+
+    /* 4–5: температура БДБГ, uint16_t. */
+    value16 = logger->bdbg_data.temperature_raw;
+    payload[4] = (uint8_t)(value16 & 0xFFU);
+    payload[5] = (uint8_t)((value16 >> 8U) & 0xFFU);
+
+    /* 6: состояние датчиков и валидность данных БДБГ. */
+    payload[6] = logger->bdbg_data.status;
+
+    /* 7–8: высота LIDAR, uint16_t. */
+    value16 = logger->lidar_data.distance_cm;
+    payload[7] = (uint8_t)(value16 & 0xFFU);
+    payload[8] = (uint8_t)((value16 >> 8U) & 0xFFU);
+
+    /* 9–10: мощность сигнала LIDAR, uint16_t. */
+    value16 = logger->lidar_data.strength;
+    payload[9] = (uint8_t)(value16 & 0xFFU);
+    payload[10] = (uint8_t)((value16 >> 8U) & 0xFFU);
+
+    /* 11–14: широта GPS, float. */
+    memcpy(&payload[11],
+           &logger->gps_data.current_coord.lat,
+           sizeof(float));
+
+    /* 15–18: долгота GPS, float. */
+    memcpy(&payload[15],
+           &logger->gps_data.current_coord.lon,
+           sizeof(float));
+
+    /*
+     * 19–22: высота GPS над уровнем моря.
+     * Временно 0.0f до реализации обработки $GNGGA.
+     */
+    {
+        const float gps_altitude = 0.0f;
+        memcpy(&payload[19], &gps_altitude, sizeof(float));
+    }
+
+    /*
+     * 23: количество спутников GPS.
+     * Временно 0 до реализации обработки $GNGGA.
+     */
+    payload[23] = 0U;
+
+    /*
+     * 24–27: напряжение батареи, float.
+     * Пока поле logger->battery_voltage содержит
+     * согласованное отладочное значение 1.0f.
+     */
+    memcpy(&payload[24],
+           &logger->battery_voltage,
+           sizeof(float));
+
+    /*
+     * 28–30: время текущего GPS-измерения.
+     * Три отдельных байта: HH, MM, SS.
+     */
+    payload[28] = logger->gps_data.current_gps_time.hour;
+    payload[29] = logger->gps_data.current_gps_time.minute;
+    payload[30] = logger->gps_data.current_gps_time.second;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
  * Формирует и записывает итоговый накопленный
  * спектр в открытый CSV-файл SD-карты.
@@ -1940,7 +2044,12 @@ void LoggerStateMachine_Init(LoggerStateMachine *logger)
 		 * Дата и время начала набора спектра.
 		 * Будут заполнены после подтверждения START_SPECTRE_REQ.
 		 */
-		logger->spectrum_start_time = (GPS_TimeStamp){0};						
+		logger->spectrum_start_time = (GPS_TimeStamp){0};	
+
+
+		logger->battery_voltage = 1.0f;
+
+		
 }
 
 
@@ -2275,7 +2384,127 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
     if (logger == 0)
     {
         return;
+    }	
+		
+   
+    /*
+     * ============================================================
+     * Закрытие CSV-файла при завершении радиационной разведки.
+     * ============================================================
+     *
+     * MODE_RETURN:
+     *   Разведка завершена, аппарат возвращается на базу.
+     *   Новые данные на SD-карту больше не записываем.
+     *   ID19 продолжает передаваться только по RadioLine.
+     *
+     * MODE_ERROR:
+     *   Разведка прекращена из-за аварийной ситуации.
+     *   Запись на SD-карту необходимо завершить
+     *   независимо от причины аварии.
+     *
+     * Исключение для MODE_ERROR:
+     *   Если стейт-машина находится в WORK_SD,
+     *   закрывать файл пока нельзя.
+     *
+     *   WORK_SD должен сначала сохранить последний
+     *   накопленный спектр ID23.
+     *
+     *   После завершения WORK_SD состояние изменится
+     *   на COMMAND_INFO, и файл будет закрыт
+     *   при следующем вызове этой функции.
+     */
+    if ((logger->req_mode == MODE_RETURN) ||
+        ((logger->req_mode == MODE_ERROR) &&
+         (logger->state != WORK_SD)))
+    {
+       
+        /*
+         * Закрываем CSV-файл только при выполнении
+         * двух условий:
+         *
+         * 1. Файл действительно открыт.
+         *
+         * 2. Работа с SD-картой не была отключена
+         *    вследствие предыдущей ошибки.
+         *
+         * Если SD-карта уже отключена,
+         * SD_Logger_Close() возвращает
+         * SD_LOGGER_DISABLED, не выполняя f_close().
+         *
+         * Дополнительная проверка предотвращает
+         * бесполезные повторные вызовы этой функции
+         * при каждом проходе стейт-машины.
+         */
+        if ((SD_Logger_IsFileOpen() != 0U) &&
+            (SD_Logger_IsEnabled() != 0U))
+
+        {
+            /*
+             * Закрываем CSV-файл.
+             *
+             * SD_Logger_Close() выполняет f_close().
+             *
+             * При ошибке FatFs модуль SD:
+             *   - регистрирует ошибку;
+             *   - запрещает дальнейшую запись;
+             *   - формирует событие для ID16.
+             *
+             * Ошибка закрытия не должна блокировать
+             * дальнейшую работу стейт-машины.
+             */
+            (void)SD_Logger_Close();
+        }
     }
+		
+		
+    /*
+     * ============================================================
+     * Контроль ошибок SD-карты.
+     * ============================================================
+     *
+     * SD_Logger_TakeErrorEvent() возвращает:
+     *
+     * 0 — нового события ошибки нет;
+     * 1 — обнаружена ошибка SD-карты.
+     *
+     * После чтения событие сбрасывается.
+     * Поэтому повторно отправлять ID16 из-за
+     * одного и того же события не будем.
+     *
+     * Проверка выполняется независимо от текущего
+     * состояния и режима работы LOGGER.
+     */
+			if (SD_Logger_TakeErrorEvent() != 0U)
+			{
+					/*
+					 * ID16 — ошибка SD-карты.
+					 *
+					 * Согласно протоколу RadioLine,
+					 * даже если дополнительных данных нет,
+					 * Payload должен содержать один байт 0x01.
+					 *
+					 * Поле Length содержит значение 1
+					 * и занимает два байта в радиопакете.
+					 */
+					const uint8_t payload = 1U;
+
+					/*
+					 * Отправляем сообщение об ошибке SD-карты
+					 * на наземную станцию.
+					 *
+					 * ID     = 16
+					 * Length = 1
+					 * Payload = 0x01
+					 *
+					 * Текущее состояние стейт-машины не изменяем.
+					 */
+					(void)RadioLine_SendPacket(
+							16U,
+							&payload,
+							1U
+					);
+			}
+
 
 
 		#ifdef DEBUG_MODE
@@ -3523,11 +3752,17 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 					  break;   
 			  } 				
 				
+				
 				case GPS_ERROR_PROC:
 				{
 						/*
-						 * В MODE_TEST ошибка GPS обрабатывается
+						 * MODE_TEST — предполётное тестирование GPS.
+						 *
+						 * Ошибка GPS в этом режиме обрабатывается
 						 * непосредственно обработчиком TIM3.
+						 *
+						 * Здесь только освобождаем прибор
+						 * и возвращаемся к обработке команд.
 						 */
 						if (logger->req_mode == MODE_TEST)
 						{
@@ -3537,13 +3772,21 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						}
 
 						/*
-						 * В MODE_EXPECT, MODE_WORK и MODE_RETURN
-						 * учитываем последовательные ошибки GPS.
+						 * Ошибки GPS учитываем в трёх режимах:
+						 *
+						 * MODE_EXPECT — ожидание начала разведки;
+						 * MODE_WORK   — радиационная разведка;
+						 * MODE_RETURN — возвращение.
 						 */
-						if ((logger->req_mode == MODE_EXPECT) || (logger->req_mode == MODE_WORK) || (logger->req_mode == MODE_RETURN))
+						if ((logger->req_mode == MODE_EXPECT) ||
+								(logger->req_mode == MODE_WORK)   ||
+								(logger->req_mode == MODE_RETURN))
 						{
 								/*
-								 * Защита счётчика от переполнения.
+								 * Увеличиваем счётчик последовательных
+								 * ошибок GPS.
+								 *
+								 * Защита от переполнения uint8_t.
 								 */
 								if (logger->gps_error_counter < UINT8_MAX)
 								{
@@ -3551,10 +3794,11 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								}
 
 								/*
-								 * Пока установленный предел не достигнут,
-								 * возвращаемся к ожиданию следующего запроса.
+								 * Пока предел последовательных ошибок
+								 * не достигнут, продолжаем работу.
 								 */
-								if (logger->gps_error_counter < LOGGER_DEVICE_ERROR_LIMIT)
+								if (logger->gps_error_counter <
+										LOGGER_DEVICE_ERROR_LIMIT)
 								{
 										logger->dev_type = DEV_NONE;
 										logger->state = COMMAND_INFO;
@@ -3562,24 +3806,68 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								}
 
 								/*
-								 * Достигнут предел последовательных ошибок GPS.
+								 * Достигнут предел последовательных
+								 * ошибок GPS.
 								 *
-								 * ID14 — GPS вышел из строя,
-								 * радиационная разведка невозможна.
+								 * ID25 — дальнейшее выполнение задания
+								 * невозможно из-за отказа прибора.
+								 *
+								 * Полезная нагрузка:
+								 * 0x02 — GPS.
+								 *
+								 * Размер — 1 байт.
 								 */
-								(void)RadioLine_SendPacket(14U, NULL, 0U);
+								const uint8_t failed_device = 2U;
 
+								/*
+								 * Передаём ID25 на наземную станцию.
+								 *
+								 * Прежний ID14 здесь больше
+								 * не используется.
+								 */
+								(void)RadioLine_SendPacket(
+										25U,
+										&failed_device,
+										1U
+								);
+
+								/*
+								 * Записываем тот же ID25 на SD-карту.
+								 *
+								 * Если файл не открыт или SD недоступна,
+								 * модуль регистрации обработает ситуацию
+								 * согласно своей логике.
+								 *
+								 * Ошибка записи не препятствует
+								 * переходу в MODE_ERROR.
+								 */
+								(void)SD_Logger_WritePacket(
+										25U,
+										&failed_device,
+										1U
+								);
+
+								/*
+								 * Переводим систему в аварийный режим.
+								 */
 								logger->req_mode = MODE_ERROR;
+
+								/*
+								 * Освобождаем прибор и возвращаемся
+								 * к обработке команд.
+								 */
 								logger->dev_type = DEV_NONE;
 								logger->state = COMMAND_INFO;
 
 								break;
 						}
 
+						/*
+						 * Для остальных режимов сохраняем
+						 * существующее поведение.
+						 */
 						break;
-				}			
-				
-				
+				}				
 				
 
         /*
@@ -3721,6 +4009,19 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             /* Корректный ответ прерывает серию последовательных ошибок. */
             lidar_info = 0U;
             logger->lidar_error_counter = 0U;
+						
+						/*
+						 * Сохраняем последнее корректное измерение LIDAR.
+						 *
+						 * Значения distance_cm и strength понадобятся
+						 * при формировании пакета ID22 в состоянии WORK_SD.
+						 *
+						 * Данные сохраняются только после успешной
+						 * проверки ответа функцией LIDAR_Process().
+						 */
+						logger->lidar_data = measurement;
+						
+						
 
             if (logger->req_mode == MODE_TEST)
             {
@@ -3832,53 +4133,68 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             /* Защита от неизвестного рабочего подрежима. */
             logger->state = COMMAND_INFO;
             break;
-        }
-				
-				
-				
+        }	
 
-        case LIDAR_ERROR_PROC:
+        
+				case LIDAR_ERROR_PROC:
 				{
 						/*
-						 * Прекращаем ожидание ответа LIDAR и останавливаем приём.
-						 * Это безопасно и при ошибке запуска DMA, когда TIM3 не запускался.
+						 * Прекращаем ожидание ответа LIDAR
+						 * и останавливаем приём данных.
+						 *
+						 * Это безопасно также при ошибке запуска DMA,
+						 * когда таймер TIM3 ещё не был запущен.
 						 */
 						(void)HAL_TIM_Base_Stop_IT(&htim3);
 						LIDAR_StopReceive();
 
-						/* Очищаем признаки завершения приёма и таймаута. */
+						/*
+						 * Очищаем признаки завершения приёма,
+						 * таймаута и активного прибора.
+						 */
 						lidar_info = 0U;
 						device_timeout = 0U;
 						logger->dev_type = DEV_NONE;
 
 						/*
-						 * MODE_TEST: ошибка предполётной проверки LIDAR.
-						 * ID12 — "LIDAR неисправен (нет передачи данных)".
-						 * Счётчик ошибок в режиме тестирования не увеличиваем.
+						 * MODE_TEST — предполётная проверка LIDAR.
+						 *
+						 * ID12 сообщает об отсутствии передачи
+						 * данных от LIDAR.
+						 *
+						 * Счётчик последовательных ошибок
+						 * в режиме тестирования не увеличиваем.
 						 */
 						if (logger->req_mode == MODE_TEST)
 						{
 								(void)RadioLine_SendPacket(12U, NULL, 0U);
+
 								logger->state = COMMAND_INFO;
 								break;
 						}
 
 						/*
-						 * MODE_WORK: учитываем последовательные ошибки LIDAR.
+						 * MODE_WORK — радиационная разведка.
+						 *
+						 * Учитываем последовательные ошибки LIDAR.
 						 */
 						if (logger->req_mode == MODE_WORK)
 						{
-								/* Защита счётчика от переполнения uint8_t. */
+								/*
+								 * Увеличиваем счётчик с защитой
+								 * от переполнения uint8_t.
+								 */
 								if (logger->lidar_error_counter < UINT8_MAX)
 								{
 										logger->lidar_error_counter++;
 								}
 
 								/*
-								 * Пока предел ошибок не достигнут,
-								 * возвращаемся к обработке команд.
+								 * Если предел последовательных ошибок
+								 * ещё не достигнут, продолжаем работу.
 								 */
-								if (logger->lidar_error_counter < LOGGER_DEVICE_ERROR_LIMIT)
+								if (logger->lidar_error_counter <
+										LOGGER_DEVICE_ERROR_LIMIT)
 								{
 										logger->state = COMMAND_INFO;
 										break;
@@ -3886,20 +4202,60 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 								/*
 								 * Достигнут предел последовательных ошибок.
-								 * ID13 — "LIDAR вышел из строя, разведка невозможна".
-								 * Используется стандартный Payload.
+								 *
+								 * ID25 — дальнейшая радиационная
+								 * разведка невозможна.
+								 *
+								 * Код неисправного прибора:
+								 * 0x01 — LIDAR.
 								 */
-								(void)RadioLine_SendPacket(13U, NULL, 0U);
+								const uint8_t failed_device = 1U;
 
+								/*
+								 * Отправляем ID25 на наземную станцию.
+								 *
+								 * Ранее здесь использовался ID13.
+								 * Теперь ID13 в MODE_WORK не отправляем.
+								 */
+								(void)RadioLine_SendPacket(
+										25U,
+										&failed_device,
+										1U
+								);
+
+								/*
+								 * Сохраняем тот же пакет ID25
+								 * в открытом CSV-файле SD-карты.
+								 *
+								 * При ошибке SD модуль регистрации
+								 * самостоятельно отключает запись.
+								 *
+								 * Ошибка SD не должна препятствовать
+								 * переходу в аварийный режим.
+								 */
+								(void)SD_Logger_WritePacket(
+										25U,
+										&failed_device,
+										1U
+								);
+
+								/*
+								 * Дальнейшая радиационная разведка
+								 * невозможна из-за отказа LIDAR.
+								 */
 								logger->req_mode = MODE_ERROR;
 								logger->state = COMMAND_INFO;
+
 								break;
 						}
 
-						/* Защита от неожиданного режима работы. */
+						/*
+						 * Защита от неожиданного режима работы.
+						 */
 						logger->state = COMMAND_INFO;
 						break;
 				}
+		
 
         case REQ_BDBG:
         {
@@ -4304,29 +4660,36 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						}
 
 						break;
-				}	
+				}			
 
-        case BDBG_ERROR_PROC:
+								
+				case BDBG_ERROR_PROC:
 				{
 						/*
 						 * Завершаем возможный незаконченный обмен
-						 * с БДБГ-15.
+						 * с прибором БДБГ-15.
 						 */
 						(void)HAL_TIM_Base_Stop_IT(&htim3);
 						BDBG_StopReceive();
 
+						/*
+						 * Сбрасываем признак таймаута и освобождаем
+						 * идентификатор активного прибора.
+						 */
 						device_timeout = 0U;
 						logger->dev_type = DEV_NONE;
 
 						/*
-						 * Ошибки БДБГ учитываются только
-						 * в рабочем режиме.
+						 * Последовательные ошибки БДБГ учитываем
+						 * только во время радиационной разведки.
 						 */
 						if (logger->req_mode == MODE_WORK)
 						{
 								/*
-								 * Увеличиваем счётчик последовательных ошибок
-								 * с защитой от переполнения uint8_t.
+								 * Увеличиваем счётчик ошибок.
+								 *
+								 * Проверка UINT8_MAX предотвращает
+								 * переполнение восьмибитного счётчика.
 								 */
 								if (logger->bdbg_error_counter < UINT8_MAX)
 								{
@@ -4334,23 +4697,68 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								}
 
 								/*
-								 * Проверяем достижение допустимого
+								 * Проверяем достижение предельного
 								 * количества последовательных ошибок.
 								 */
-								if (logger->bdbg_error_counter >= LOGGER_DEVICE_ERROR_LIMIT)
+								if (logger->bdbg_error_counter >=
+										LOGGER_DEVICE_ERROR_LIMIT)
 								{
 										/*
-										 * ID10 — БДБГ вышел из строя,
-										 * радиационная разведка невозможна.
+										 * ID25 — дальнейшая радиационная
+										 * разведка невозможна из-за отказа
+										 * прибора БДБГ.
+										 *
+										 * Полезная нагрузка:
+										 *
+										 * 0x00 — БДБГ.
+										 *
+										 * Размер полезной нагрузки — 1 байт.
 										 */
-										(void)RadioLine_SendPacket(10U, NULL, 0U);
+										const uint8_t failed_device = 0U;
 
+										/*
+										 * Отправляем сообщение об отказе
+										 * прибора на наземную станцию.
+										 *
+										 * ID10 здесь больше не используется.
+										 */
+										(void)RadioLine_SendPacket(
+												25U,
+												&failed_device,
+												1U
+										);
+
+										/*
+										 * Сохраняем тот же пакет ID25
+										 * в CSV-файле SD-карты.
+										 *
+										 * Модуль SD самостоятельно проверяет
+										 * доступность карты и открытого файла.
+										 *
+										 * Ошибка записи не должна блокировать
+										 * переход в аварийный режим.
+										 */
+										(void)SD_Logger_WritePacket(
+												25U,
+												&failed_device,
+												1U
+										);
+
+										/*
+										 * Дальнейшая радиационная разведка
+										 * невозможна.
+										 */
 										logger->req_mode = MODE_ERROR;
 
 										/*
-										 * Если ошибка произошла во время
-										 * завершающего PAED_REQ, накопленный
-										 * спектр всё равно необходимо сохранить.
+										 * Если отказ произошёл во время
+										 * завершающего PAED_REQ, необходимо
+										 * сохранить накопленный спектр ID23.
+										 *
+										 * Поэтому сначала переходим в WORK_SD.
+										 *
+										 * Закрытие CSV-файла при MODE_ERROR
+										 * реализуем отдельным этапом.
 										 */
 										if (logger->bdbg_spectrum_stopping != 0U)
 										{
@@ -4365,25 +4773,28 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								}
 
 								/*
-								 * Если процедура остановки спектра уже началась,
-								 * а лимит ошибок ещё не исчерпан,
-								 * повторяем завершающий PAED_REQ.
+								 * Если завершение накопления спектра
+								 * уже началось, но предел ошибок ещё
+								 * не достигнут, повторяем PAED_REQ.
 								 */
 								if (logger->bdbg_spectrum_stopping != 0U)
 								{
 										logger->bdbg_request = PAED_REQ;
 										logger->state = REQ_BDBG;
+
 										break;
 								}
 						}
 
 						/*
-						 * Обычная обработка ошибок БДБГ:
-						 * возвращаемся к ожиданию команд.
+						 * При обычной ошибке возвращаемся
+						 * к обработке команд.
 						 */
 						logger->state = COMMAND_INFO;
+
 						break;
-				}
+				}		
+				
 
         case REQ_BATTERY:
         case BATTERY_PROC:
@@ -4391,87 +4802,120 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
         {
             /* Заглушка обработки аккумулятора. */
             break;
-        }				
-       
+        }			
+			
 				case WORK_SD:
 				{
 						/*
-						 * Состояние сохранения итогового накопленного
-						 * спектра на SD-карту.
+						 * Сначала проверяем завершение спектрального режима.
 						 *
-						 * Сюда переходим после завершения набора
-						 * спектра прибором БДБГ-15.
-						 *
-						 * Отдельные порции спектра на SD не записываем.
-						 */
-
-						/*
-						 * Проверяем, что выполнялась процедура
-						 * завершения спектрального режима.
+						 * Эта ветка сохраняет существующую обработку ID23.
+						 * Её приоритет не изменяем.
 						 */
 						if (logger->bdbg_spectrum_stopping != 0U)
 						{
 								/*
-								 * Записываем полный накопленный спектр.
+								 * Записываем полный накопленный спектр ID23.
 								 *
-								 * SD_WriteAccumulatedSpectrum():
-								 * - формирует 2070 байт полезной нагрузки;
-								 * - добавляет дату, номер спектра, GPS, LIDAR;
-								 * - записывает 1024 канала;
-								 * - сохраняет строку CSV с ID23;
-								 * - выполняет f_sync().
-								 *
-								 * Результат записи не должен влиять
-								 * на завершение спектрального режима.
+								 * Функция самостоятельно проверяет доступность SD
+								 * и выполняет синхронизацию файла.
 								 */
 								SD_LoggerResult sd_result =
 										SD_WriteAccumulatedSpectrum(logger);
 
 								/*
-								 * Если SD-карта недоступна или файл
-								 * не открыт, спектр остаётся в RAM.
-								 *
-								 * При ошибке FatFs модуль sd_logger
-								 * самостоятельно отключает запись
-								 * и устанавливает событие ошибки.
-								 *
-								 * Событие будет обработано отдельно
-								 * механизмом контроля SD.
+								 * Ошибка SD не должна препятствовать
+								 * завершению спектрального режима.
 								 */
 								(void)sd_result;
 
-								/*
-								 * Завершаем спектральный режим независимо
-								 * от результата записи на SD.
-								 */
+								/* Завершаем спектральный режим. */
 								logger->bdbg_spectrum_active = 0U;
 								logger->bdbg_spectrum_stopping = 0U;
 
-								/*
-								 * Возвращаем обычный запрос ПАЕД.
-								 */
+								/* Восстанавливаем обычный запрос ПАЕД. */
 								logger->bdbg_request = PAED_REQ;
 
-								/*
-								 * Восстанавливаем режим работы,
-								 * действовавший до начала набора спектра.
-								 */
+								/* Возвращаем предыдущий режим работы. */
 								logger->work_mode = logger->old_work_mode;
 
-								/*
-								 * Останавливаем интервал измерения.
-								 */
+								/* Останавливаем интервал измерения. */
 								LoggerStateMachine_StopInterval(logger);
+
+								/* Возвращаемся к обработке команд. */
+								logger->state = COMMAND_INFO;
+
+								break;
+						}
+
+						/*
+						 * ID22 формируем только при радиационной разведке.
+						 *
+						 * Разрешённые режимы:
+						 * MODE_OPERATOR, MODE_TIME, MODE_DISTANCE.
+						 */
+						if ((logger->req_mode == MODE_WORK) &&
+								((logger->work_mode == MODE_OPERATOR) ||
+								 (logger->work_mode == MODE_TIME) ||
+								 (logger->work_mode == MODE_DISTANCE)))
+						{
+								/*
+								 * Буфер полезной нагрузки ID22.
+								 *
+								 * Размер фиксирован: 31 байт.
+								 * Динамическая память не используется.
+								 */
+								uint8_t payload[ID22_PAYLOAD_SIZE];
+
+								/*
+								 * Формируем пакет из результатов
+								 * последнего цикла измерений.
+								 */
+								Logger_BuildID22Payload(logger, payload);
+
+								/*
+								 * Передаём ID22 по RadioLine.
+								 *
+								 * Ошибка передачи не должна блокировать
+								 * попытку сохранения на SD-карту.
+								 */
+								(void)RadioLine_SendPacket(
+										22U,
+										payload,
+										ID22_PAYLOAD_SIZE
+								);
+
+								/*
+								 * Сохраняем ID22 в CSV-файл SD-карты.
+								 *
+								 * SD_Logger_WritePacket самостоятельно
+								 * проверяет доступность файла и выполняет f_sync().
+								 */
+								(void)SD_Logger_WritePacket(
+										22U,
+										payload,
+										ID22_PAYLOAD_SIZE
+								);
 
 								/*
 								 * Возвращаемся к обработке команд.
+								 *
+								 * Переход в WORK_SD после BATTERY_PROC
+								 * будет подключён отдельно.
 								 */
 								logger->state = COMMAND_INFO;
+
+								break;
 						}
 
+						/*
+						 * Защита от попадания в WORK_SD
+						 * при неподходящем режиме работы.
+						 */
+						logger->state = COMMAND_INFO;
 						break;
-				}	
-				
+				}			
+			
 	
 				
         /*
