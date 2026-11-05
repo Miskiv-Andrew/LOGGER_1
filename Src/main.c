@@ -713,6 +713,9 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
+
+
+
 static void MX_ADC1_Init(void)
 {
 
@@ -759,7 +762,7 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
@@ -774,6 +777,13 @@ static void MX_ADC1_Init(void)
   /* USER CODE END ADC1_Init 2 */
 
 }
+
+
+
+
+
+
+
 
 /**
   * @brief LPUART1 Initialization Function

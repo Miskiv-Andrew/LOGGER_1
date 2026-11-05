@@ -121,13 +121,22 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
     __HAL_RCC_ADC_CLK_ENABLE();
 
     __HAL_RCC_GPIOC_CLK_ENABLE();
-    /**ADC1 GPIO Configuration
-    PC2     ------> ADC1_IN3
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_2;
+		
+		
+   
+    /*
+     * Настройка аналогового входа для измерения
+     * напряжения аккумулятора.
+     *
+     * Источник сигнала: Holybro PM02 V3.
+     * Коэффициент делителя напряжения: 18.182.
+     *
+     * PC1 подключён к ADC1_IN1.
+     */
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);		
 
     /* ADC1 DMA Init */
     /* ADC1 Init */
@@ -171,10 +180,13 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* hadc)
     /* Peripheral clock disable */
     __HAL_RCC_ADC_CLK_DISABLE();
 
-    /**ADC1 GPIO Configuration
-    PC2     ------> ADC1_IN3
-    */
-    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_2);
+   
+    /*
+     * Освобождаем аналоговый вход PC1 (ADC1_IN1),
+     * используемый для измерения напряжения аккумулятора.
+     */
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_1);
+
 
     /* ADC1 DMA DeInit */
     HAL_DMA_DeInit(hadc->DMA_Handle);

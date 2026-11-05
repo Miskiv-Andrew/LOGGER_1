@@ -2505,8 +2505,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 					);
 			}
 
-
-
 		#ifdef DEBUG_MODE
 		/*
 		 * Запоминаем состояние, для которого
