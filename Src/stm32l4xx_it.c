@@ -69,6 +69,16 @@ extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
 
+
+/*
+ * Дескриптор ADC1 определён в main.c.
+ *
+ * Используется аппаратным обработчиком
+ * прерывания ADC1.
+ */
+extern ADC_HandleTypeDef hadc1;
+
+
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -378,5 +388,30 @@ void LPUART1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+
+/*
+ * ============================================================
+ * АППАРАТНОЕ ПРЕРЫВАНИЕ ADC1
+ * ============================================================
+ *
+ * Вызывается при завершении преобразования ADC1
+ * либо при возникновении ошибки ADC.
+ *
+ * Передаём управление библиотеке STM32 HAL.
+ *
+ * HAL самостоятельно определяет причину прерывания
+ * и вызывает соответствующий callback:
+ *
+ * HAL_ADC_ConvCpltCallback()
+ * HAL_ADC_ErrorCallback()
+ *
+ * Оба callback реализованы в main.c.
+ */
+void ADC1_2_IRQHandler(void)
+{
+    HAL_ADC_IRQHandler(&hadc1);
+}
+
 
 /* USER CODE END 1 */
