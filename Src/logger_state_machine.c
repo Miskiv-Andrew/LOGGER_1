@@ -4920,9 +4920,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 						break;
 				}		
-				
 
-        
+								
 				case REQ_BATTERY:
 				{
 						/*
@@ -4943,13 +4942,19 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 */
 
 						/*
-						 * Останавливаем приём данных GPS и LIDAR.
+						 * Останавливаем приём данных GPS, LIDAR и BDBG.
 						 *
-						 * Одновременный опрос этих приборов
-						 * во время контроля аккумулятора не требуется.
+						 * Во время измерения аккумулятора обмен
+						 * с другими приборами не требуется.
+						 *
+						 * BDBG_StopReceive() безопасно вызывать,
+						 * даже если приём BDBG уже остановлен.
+						 *
+						 * UART при этом не деинициализируется.
 						 */
 						GPS_StopReceive();
 						LIDAR_StopReceive();
+						BDBG_StopReceive();
 
 						/*
 						 * Отключаем обработку возможных запоздавших
@@ -4974,7 +4979,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 */
 						logger->dev_type = DEV_BATTERY;
 
-						
 						/*
 						 * ========================================================
 						 * ПОДГОТОВКА НОВОГО ЦИКЛА ИЗМЕРЕНИЙ ADC
@@ -5015,7 +5019,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 */
 						logger->battery_adc_count = 0U;
 
-
 						/*
 						 * Перед калибровкой останавливаем ADC.
 						 *
@@ -5036,8 +5039,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 * первого преобразования.
 						 */
 						if (HAL_ADCEx_Calibration_Start(
-										&hadc1,
-										ADC_SINGLE_ENDED) != HAL_OK)
+														&hadc1,
+														ADC_SINGLE_ENDED) != HAL_OK)
 						{
 								logger->dev_type = DEV_NONE;
 								logger->state = BATTERY_ERROR_PROC;
@@ -5054,8 +5057,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 * константы LOGGER_BATTERY_TIMEOUT_MS.
 						 */
 						__HAL_TIM_SET_AUTORELOAD(
-								&htim3,
-								LOGGER_BATTERY_TIMEOUT_MS - 1U
+										&htim3,
+										LOGGER_BATTERY_TIMEOUT_MS - 1U
 						);
 
 						/*
@@ -5130,7 +5133,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						break;
 				}
 
-				
 				case BATTERY_PROC:
 				{
 						/*
@@ -5720,57 +5722,184 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						logger->state = COMMAND_INFO;
 
 						break;
-				}			
-				
+				}	
+
 				
 				case WORK_SD:
 				{
 						/*
-						 * Сначала проверяем завершение спектрального режима.
+						 * ========================================================
+						 * WORK_SD — РАБОТА С SD-КАРТОЙ
+						 * ========================================================
 						 *
-						 * Эта ветка сохраняет существующую обработку ID23.
-						 * Её приоритет не изменяем.
+						 * MODE_TEST:
+						 *   Проверка работоспособности SD-карты.
+						 *
+						 * MODE_WORK:
+						 *   Сохранение ID22 и завершение спектрального режима.
 						 */
-						if (logger->bdbg_spectrum_stopping != 0U)
+
+						/*
+						 * ========================================================
+						 * 1. ПРЕДПОЛЁТНАЯ ПРОВЕРКА — MODE_TEST
+						 * ========================================================
+						 */
+						if (logger->req_mode == MODE_TEST)
 						{
 								/*
-								 * Записываем полный накопленный спектр ID23.
+								 * Монтирование SD-карты уже выполнено в main.c.
 								 *
-								 * Функция самостоятельно проверяет доступность SD
-								 * и выполняет синхронизацию файла.
+								 * Проверяем возможность записи через временный файл:
+								 * создание -> запись -> f_sync -> закрытие -> удаление.
+								 *
+								 * Основной CSV-файл разведки не создаём.
 								 */
-								SD_LoggerResult sd_result =
-										SD_WriteAccumulatedSpectrum(logger);
+								SD_LoggerResult sd_result = SD_Logger_TestWrite();
 
 								/*
-								 * Ошибка SD не должна препятствовать
-								 * завершению спектрального режима.
+								 * ====================================================
+								 * SD-КАРТА НЕИСПРАВНА
+								 * ====================================================
 								 */
-								(void)sd_result;
+								if (sd_result != SD_LOGGER_OK)
+								{
+										/*
+										 * SD_Logger_TestWrite() при ошибке FatFs
+										 * вызывает SD_Logger_SetError().
+										 *
+										 * Эта функция устанавливает sd_error_event,
+										 * который обычно обрабатывается в начале
+										 * LoggerStateMachine_Process().
+										 *
+										 * Но здесь сообщение ID16 отправляем сами.
+										 *
+										 * Поэтому забираем ожидающее событие,
+										 * чтобы исключить повторную отправку ID16
+										 * на следующем проходе стейт-машины.
+										 *
+										 * SD_Logger_TakeErrorEvent() сбрасывает только
+										 * событие уведомления, но не восстанавливает
+										 * разрешение записи на неисправную SD-карту.
+										 */
+										(void)SD_Logger_TakeErrorEvent();
 
-								/* Завершаем спектральный режим. */
-								logger->bdbg_spectrum_active = 0U;
-								logger->bdbg_spectrum_stopping = 0U;
+										/*
+										 * ID16 — SD-карта неисправна.
+										 *
+										 * Используем стандартный Payload,
+										 * предусмотренный RadioLine_SendPacket().
+										 */
+										(void)RadioLine_SendPacket(
+												16U,
+												NULL,
+												0U
+										);
 
-								/* Восстанавливаем обычный запрос ПАЕД. */
-								logger->bdbg_request = PAED_REQ;
+										/*
+										 * MODE_TEST сохраняем.
+										 *
+										 * Предполётная проверка прекращается.
+										 * Ожидаем решения оператора.
+										 */
+										logger->state = COMMAND_INFO;
 
-								/* Возвращаем предыдущий режим работы. */
-								logger->work_mode = logger->old_work_mode;
+										break;
+								}
 
-								/* Останавливаем интервал измерения. */
-								LoggerStateMachine_StopInterval(logger);
+								/*
+								 * ====================================================
+								 * SD-КАРТА ИСПРАВНА
+								 * ====================================================
+								 *
+								 * Все операции с временным файлом
+								 * завершились успешно.
+								 *
+								 * write_card_flag уже установлен после
+								 * успешного монтирования SD-карты.
+								 *
+								 * Основной CSV-файл будет создан позднее,
+								 * после получения исходных данных разведки.
+								 */
 
-								/* Возвращаемся к обработке команд. */
+								/*
+								 * ID18 — система радиационной разведки исправна.
+								 */
+								(void)RadioLine_SendPacket(
+										18U,
+										NULL,
+										0U
+								);
+
+								/*
+								 * Предполётная проверка завершена.
+								 *
+								 * Переходим в режим ожидания разведки.
+								 */
+								logger->req_mode = MODE_EXPECT;
+
+								/*
+								 * Ожидаем загрузку исходных данных разведки.
+								 */
 								logger->state = COMMAND_INFO;
 
 								break;
 						}
 
 						/*
-						 * ID22 формируем только при радиационной разведке.
+						 * ========================================================
+						 * 2. ЗАВЕРШЕНИЕ СПЕКТРАЛЬНОГО РЕЖИМА
+						 * ========================================================
 						 *
-						 * Разрешённые режимы:
+						 * Существующую обработку ID23 не изменяем.
+						 */
+						if (logger->bdbg_spectrum_stopping != 0U)
+						{
+								/*
+								 * Сохраняем полный накопленный спектр.
+								 *
+								 * Ошибка SD не препятствует завершению
+								 * спектрального режима.
+								 */
+								SD_LoggerResult sd_result =
+										SD_WriteAccumulatedSpectrum(logger);
+
+								(void)sd_result;
+
+								/*
+								 * Завершаем спектральный режим.
+								 */
+								logger->bdbg_spectrum_active = 0U;
+								logger->bdbg_spectrum_stopping = 0U;
+
+								/*
+								 * Восстанавливаем обычный запрос ПАЕД.
+								 */
+								logger->bdbg_request = PAED_REQ;
+
+								/*
+								 * Восстанавливаем предыдущий режим работы.
+								 */
+								logger->work_mode = logger->old_work_mode;
+
+								/*
+								 * Останавливаем интервал измерения.
+								 */
+								LoggerStateMachine_StopInterval(logger);
+
+								/*
+								 * Возвращаемся к обработке команд.
+								 */
+								logger->state = COMMAND_INFO;
+
+								break;
+						}
+
+						/*
+						 * ========================================================
+						 * 3. РАБОЧИЙ РЕЖИМ — MODE_WORK
+						 * ========================================================
+						 *
+						 * ID22 формируем только в режимах:
 						 * MODE_OPERATOR, MODE_TIME, MODE_DISTANCE.
 						 */
 						if ((logger->req_mode == MODE_WORK) &&
@@ -5780,23 +5909,17 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						{
 								/*
 								 * Буфер полезной нагрузки ID22.
-								 *
 								 * Размер фиксирован: 31 байт.
-								 * Динамическая память не используется.
 								 */
 								uint8_t payload[ID22_PAYLOAD_SIZE];
 
 								/*
-								 * Формируем пакет из результатов
-								 * последнего цикла измерений.
+								 * Формируем ID22 из результатов измерений.
 								 */
 								Logger_BuildID22Payload(logger, payload);
 
 								/*
 								 * Передаём ID22 по RadioLine.
-								 *
-								 * Ошибка передачи не должна блокировать
-								 * попытку сохранения на SD-карту.
 								 */
 								(void)RadioLine_SendPacket(
 										22U,
@@ -5805,10 +5928,10 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								);
 
 								/*
-								 * Сохраняем ID22 в CSV-файл SD-карты.
+								 * Сохраняем ID22 в CSV-файл.
 								 *
-								 * SD_Logger_WritePacket самостоятельно
-								 * проверяет доступность файла и выполняет f_sync().
+								 * SD_Logger_WritePacket() самостоятельно
+								 * проверяет разрешение записи и выполняет f_sync().
 								 */
 								(void)SD_Logger_WritePacket(
 										22U,
@@ -5818,9 +5941,6 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 								/*
 								 * Возвращаемся к обработке команд.
-								 *
-								 * Переход в WORK_SD после BATTERY_PROC
-								 * будет подключён отдельно.
 								 */
 								logger->state = COMMAND_INFO;
 
@@ -5828,14 +5948,15 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						}
 
 						/*
-						 * Защита от попадания в WORK_SD
-						 * при неподходящем режиме работы.
+						 * ========================================================
+						 * 4. ЗАЩИТА ОТ НЕОЖИДАННОГО РЕЖИМА
+						 * ========================================================
 						 */
 						logger->state = COMMAND_INFO;
+
 						break;
-				}			
-			
-	
+				}
+
 				
         /*
          * Защита от некорректного состояния.
