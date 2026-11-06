@@ -42,6 +42,28 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/*
+ * Параметры первичной проверки аккумулятора.
+ *
+ * Напряжения указаны непосредственно на входе ADC1 (PC1),
+ * до пересчёта через делитель напряжения.
+ */
+#define BATTERY_ADC_REFERENCE_V       2.5f
+#define BATTERY_ADC_MAX_VALUE         4095.0f
+#define BATTERY_STARTUP_SAMPLES       10U
+
+#define BATTERY_THRESHOLD_33_V        0.824f
+#define BATTERY_THRESHOLD_66_V        0.855f
+#define BATTERY_THRESHOLD_100_V       0.915f
+
+/* Максимальное ожидание одного преобразования ADC, мс. */
+#define BATTERY_ADC_TIMEOUT_MS        100U
+
+/* Время отображения результатов первичной проверки, мс. */
+#define STARTUP_INDICATION_TIME_MS    60000U
+
+
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -502,162 +524,412 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+
+/*
+ * ============================================================
+ * Первичная проверка аккумулятора при включении LOGGER.
+ *
+ * Выполняется один раз до входа в while(1).
+ *
+ * Возвращает:
+ * 1 — измерение успешно;
+ * 0 — ошибка ADC.
+ *
+ * Измеренное напряжение на входе ADC возвращается
+ * через указатель voltage.
+ *
+ * Функция блокирующая. Это допустимо исключительно
+ * на этапе первоначальной проверки.
+ * ============================================================
+ */
+static uint8_t Battery_StartupMeasure(float *voltage)
+{
+    uint32_t adc_sum = 0U;
+    uint32_t adc_raw = 0U;
+
+    if (voltage == NULL)
+    {
+        return 0U;
+    }
+
+    *voltage = 0.0f;
+
+    /*
+     * Калибровка ADC1 перед первым измерением.
+     * ADC должен быть остановлен.
+     */
+    if (HAL_ADCEx_Calibration_Start(
+            &hadc1,
+            ADC_SINGLE_ENDED) != HAL_OK)
+    {
+        return 0U;
+    }
+
+    /*
+     * Последовательно выполняем 10 преобразований.
+     */
+    for (uint32_t i = 0U; i < BATTERY_STARTUP_SAMPLES; i++)
+    {
+        /* Запускаем одно преобразование ADC. */
+        if (HAL_ADC_Start(&hadc1) != HAL_OK)
+        {
+            (void)HAL_ADC_Stop(&hadc1);
+            return 0U;
+        }
+
+        /*
+         * Ожидаем завершения преобразования.
+         * Ожидание ограничено таймаутом.
+         */
+        if (HAL_ADC_PollForConversion(
+                &hadc1,
+                BATTERY_ADC_TIMEOUT_MS) != HAL_OK)
+        {
+            (void)HAL_ADC_Stop(&hadc1);
+            return 0U;
+        }
+
+        /* Получаем 12-битный результат измерения. */
+        adc_raw = HAL_ADC_GetValue(&hadc1);
+
+        /* Добавляем результат к общей сумме. */
+        adc_sum += adc_raw;
+
+        /* Останавливаем ADC перед следующим запуском. */
+        if (HAL_ADC_Stop(&hadc1) != HAL_OK)
+        {
+            return 0U;
+        }
+    }
+
+    /*
+     * Вычисляем среднее напряжение на входе ADC:
+     *
+     * U = SUM(raw) / 10 * 2.5 / 4095
+     *
+     * Промежуточное усреднение выполняется без
+     * целочисленного округления.
+     */
+    *voltage =
+        ((float)adc_sum * BATTERY_ADC_REFERENCE_V) /
+        ((float)BATTERY_STARTUP_SAMPLES *
+         BATTERY_ADC_MAX_VALUE);
+
+    return 1U;
+}
+
+
+
+/*
+ * ============================================================
+ * Отображение уровня аккумулятора на трёх светодиодах.
+ *
+ * PA15 — 33%.
+ * PA12 — 66%.
+ * PA11 — 100%.
+ *
+ * voltage — напряжение непосредственно на входе ADC1.
+ *
+ * При напряжении ниже 0.824 В все светодиоды выключены.
+ * ============================================================
+ */
+static void Battery_StartupShowLevel(float voltage)
+{
+    /*
+     * Сначала выключаем все три светодиода.
+     * Это исключает сохранение предыдущей индикации.
+     */
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15,
+        GPIO_PIN_RESET
+    );
+
+    /*
+     * Уровень 100%:
+     * включаем все три светодиода.
+     */
+    if (voltage >= BATTERY_THRESHOLD_100_V)
+    {
+        HAL_GPIO_WritePin(
+            GPIOA,
+            GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15,
+            GPIO_PIN_SET
+        );
+    }
+    /*
+     * Уровень 66%:
+     * включаем PA15 и PA12.
+     */
+    else if (voltage >= BATTERY_THRESHOLD_66_V)
+    {
+        HAL_GPIO_WritePin(
+            GPIOA,
+            GPIO_PIN_15 | GPIO_PIN_12,
+            GPIO_PIN_SET
+        );
+    }
+    /*
+     * Уровень 33%:
+     * включаем только PA15.
+     */
+    else if (voltage >= BATTERY_THRESHOLD_33_V)
+    {
+        HAL_GPIO_WritePin(
+            GPIOA,
+            GPIO_PIN_15,
+            GPIO_PIN_SET
+        );
+    }
+
+    /*
+     * При voltage < 0.824 В ничего не включаем.
+     */
+}
+
+
+
+
+
+
 /* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
   * @retval int
   */
+
 int main(void)
 {
+    /* USER CODE BEGIN 1 */
 
-  /* USER CODE BEGIN 1 */
+    /*
+     * Напряжение на входе ADC1 после усреднения.
+     */
+    float startup_battery_voltage = 0.0f;
 
-  /* USER CODE END 1 */
+    /*
+     * Результат первичного измерения аккумулятора.
+     */
+    uint8_t startup_battery_ok = 0U;
 
-  /* MCU Configuration--------------------------------------------------------*/
+    /* USER CODE END 1 */
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    /* MCU Configuration */
 
-  /* USER CODE BEGIN Init */
+    HAL_Init();
 
-  /* USER CODE END Init */
+    /* USER CODE BEGIN Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+    /* USER CODE END Init */
 
-  /* USER CODE BEGIN SysInit */
+    SystemClock_Config();
 
-  /* USER CODE END SysInit */
+    /* USER CODE BEGIN SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_USART3_UART_Init();
-  MX_USART2_UART_Init();
-  MX_SPI1_Init();
-  MX_FATFS_Init();
-  MX_ADC1_Init();
-  MX_UART4_Init();
-  MX_LPUART1_UART_Init();
-  MX_RTC_Init();
-  MX_TIM6_Init();
-  MX_TIM3_Init();
-	
-  /* USER CODE BEGIN 2 */
-	
-	/*
-	* ============================================================
-	* Инициализация системы регистрации данных на SD-карте.
-	* ============================================================
-	*
-	* К этому моменту:
-	*
-	* 1. SPI1 уже инициализирован.
-	* 2. Драйвер FatFs зарегистрирован.
-	* 3. RTC уже инициализирован.
-	*
-	* Ошибка SD-карты не должна останавливать LOGGER.
-	*/
+    /* USER CODE END SysInit */
 
-	/*
-	* Инициализируем внутреннее состояние модуля.
-	*/
-	SD_Logger_Init();
+    /*
+     * Инициализация периферии STM32.
+     */
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_USART3_UART_Init();
+    MX_USART2_UART_Init();
+    MX_SPI1_Init();
+    MX_FATFS_Init();
+    MX_ADC1_Init();
+    MX_UART4_Init();
+    MX_LPUART1_UART_Init();
+    MX_RTC_Init();
+    MX_TIM6_Init();
+    MX_TIM3_Init();
 
-	/*
-	* Монтируем файловую систему SD-карты.
-	*
-	* 1U — немедленно выполнить монтирование.
-	*/
-	FRESULT sd_mount_result =
-		f_mount(&USERFatFS, USERPath, 1U);
+    /* USER CODE BEGIN 2 */
 
-	/*
-	* Передаём результат монтирования модулю SD_Logger.
-	*
-	* При FR_OK запись будет разрешена.
-	*
-	* При ошибке запись будет отключена,
-	* а событие ошибки сохранится для стейт-машины.
-	*/
-	SD_Logger_SetMountResult(sd_mount_result);
-	
-	
-	/*
-	* Инициализация программной стейт-машины LOGGER.
-	*
-	* После этого вызова:
-	* req_mode = MODE_TEST;
-	* state    = COMMAND_INFO.
-	*/
-	LoggerStateMachine_Init(&logger);
-	GPS_Init();
-	/*
-	* Инициализация программного модуля LIDAR.
-	*
-	* Сбрасываем внутренние буферы, счётчики и флаги.
-	* Приём данных пока не запускаем.
-	*/
-	LIDAR_Init();
+    /*
+     * ========================================================
+     * Инициализация SD-карты.
+     * ========================================================
+     */
+
+    SD_Logger_Init();
+
+    /*
+     * Монтирование SD-карты.
+     *
+     * FR_OK означает, что файловая система доступна.
+     */
+    FRESULT sd_mount_result =
+        f_mount(&USERFatFS, USERPath, 1U);
+
+    /*
+     * Сохраняем результат для последующей работы
+     * модуля SD_Logger и стейт-машины.
+     */
+    SD_Logger_SetMountResult(sd_mount_result);
+
+    /*
+     * ========================================================
+     * Инициализация программных модулей LOGGER.
+     * ========================================================
+     */
+
+    LoggerStateMachine_Init(&logger);
+
+    GPS_Init();
+
+    LIDAR_Init();
+
     BDBG_Init();
 
-	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+    /*
+     * Управление сигналом сброса GPS.
+     * Существующую логику сохраняем.
+     */
+#ifdef DEBUG_MODE
+    HAL_GPIO_WritePin(
+        GPS_RESET_GPIO_Port,
+        GPS_RESET_Pin,
+        GPIO_PIN_RESET
+    );
+#else
+    HAL_GPIO_WritePin(
+        GPS_RESET_GPIO_Port,
+        GPS_RESET_Pin,
+        GPIO_PIN_SET
+    );
+#endif
 
-	#ifdef DEBUG_MODE
-	HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_RESET);
-	#else
-	HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_SET);
-	#endif
-	
-	
-	/*
-	* Запускаем постоянный приём данных RadioLine по USART2 через DMA.
-	*
-	* HAL_UARTEx_ReceiveToIdle_DMA():
-	* - USART2 принимает данные;
-	* - DMA записывает их в radioline_dma_rx_buffer;
-	* - при событии приёма HAL вызовет HAL_UARTEx_RxEventCallback().
-	*
-	* Сейчас мы только запускаем механизм приёма.
-	* Обработку полученных данных добавим следующим шагом.
-	*/
-	if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, radioline_dma_rx_buffer, RADIOLINE_DMA_RX_BUFFER_SIZE) != HAL_OK)
-	{
-		Error_Handler();
-	}
+    /*
+     * ========================================================
+     * Первичная проверка аккумулятора.
+     * ========================================================
+     *
+     * Выполняется один раз после включения питания.
+     * Измеряем напряжение 10 раз и вычисляем среднее.
+     */
 
-	/*
-	* Отключаем прерывание DMA по половине заполненного буфера.
-	*
-	* Для RadioLine оно нам не требуется. Нас интересуют полученные
-	* данные целиком и события окончания текущей порции приёма.
-	*/
-	__HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
-	
+    startup_battery_ok =
+        Battery_StartupMeasure(&startup_battery_voltage);
 
-  /* USER CODE END 2 */
+    /*
+     * При успешном измерении отображаем уровень заряда.
+     *
+     * При ошибке ADC все три светодиода остаются
+     * выключенными.
+     */
+    if (startup_battery_ok != 0U)
+    {
+        Battery_StartupShowLevel(startup_battery_voltage);
+    }
+    else
+    {
+        HAL_GPIO_WritePin(
+            GPIOA,
+            GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15,
+            GPIO_PIN_RESET
+        );
+    }
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
+    /*
+     * ========================================================
+     * Первичная индикация SD-карты.
+     * ========================================================
+     *
+     * PC13 = 1 — монтирование успешно.
+     * PC13 = 0 — монтирование завершилось ошибкой.
+     */
 
-    /* USER CODE BEGIN 3 */
+    HAL_GPIO_WritePin(
+        LED_GPIO_Port,
+        LED_Pin,
+        (sd_mount_result == FR_OK)
+            ? GPIO_PIN_SET
+            : GPIO_PIN_RESET
+    );
 
-			/*
-			* Выполняем один шаг основной стейт-машины LOGGER.
-			*
-			* Функция не блокирует главный цикл и после обработки
-			* текущего состояния возвращает управление сюда.
-			*/
-			LoggerStateMachine_Process(&logger);	
-		
-  }
-  /* USER CODE END 3 */
+    /*
+     * ========================================================
+     * Время визуального контроля — 60 секунд.
+     * ========================================================
+     *
+     * Оператор проверяет индикацию аккумулятора
+     * и наличие SD-карты.
+     *
+     * При необходимости питание LOGGER можно отключить
+     * для замены аккумулятора или установки SD-карты.
+     *
+     * Главная стейт-машина ещё не запущена.
+     */
+    HAL_Delay(STARTUP_INDICATION_TIME_MS);
+
+    /*
+     * ========================================================
+     * Завершение первоначальной проверки.
+     * ========================================================
+     *
+     * Выключаем все четыре светодиода.
+     */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        LED_GPIO_Port,
+        LED_Pin,
+        GPIO_PIN_RESET
+    );
+
+    /*
+     * ========================================================
+     * Запуск постоянного приёма RadioLine через USART2 DMA.
+     * ========================================================
+     *
+     * Выполняется после завершения первичной проверки.
+     */
+
+    if (HAL_UARTEx_ReceiveToIdle_DMA(
+            &huart2,
+            radioline_dma_rx_buffer,
+            RADIOLINE_DMA_RX_BUFFER_SIZE) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /*
+     * Отключаем прерывание по половине DMA-буфера.
+     */
+    __HAL_DMA_DISABLE_IT(
+        huart2.hdmarx,
+        DMA_IT_HT
+    );
+
+    /* USER CODE END 2 */
+
+    /* Infinite loop */
+
+    /* USER CODE BEGIN WHILE */
+
+    while (1)
+    {
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+
+        /*
+         * Выполняем один шаг основной стейт-машины.
+         */
+        LoggerStateMachine_Process(&logger);
+
+    }
+
+    /* USER CODE END 3 */
 }
+
 
 /**
   * @brief System Clock Configuration
@@ -1206,64 +1478,175 @@ static void MX_DMA_Init(void)
 
 }
 
+
+
+
+
+
+
+
+
+
+
+
 /**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
   */
+
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  /* USER CODE END MX_GPIO_Init_1 */
+    /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+    /* USER CODE END MX_GPIO_Init_1 */
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, LED_Pin|RE485_Pin|DE485_Pin, GPIO_PIN_RESET);
+    /*
+     * ============================================================
+     * Включение тактирования портов GPIO.
+     * ============================================================
+     */
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SD_CARD_CS_GPIO_Port, SD_CARD_CS_Pin, GPIO_PIN_SET);
+    /*
+     * ============================================================
+     * Установка начальных уровней существующих выходов.
+     * ============================================================
+     */
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPS_RESET_GPIO_Port, GPS_RESET_Pin, GPIO_PIN_RESET);
+    /* PC13 — светодиод SD-карты.
+     * PC6, PC7 — управление интерфейсом RS485.
+     */
+    HAL_GPIO_WritePin(
+        GPIOC,
+        LED_Pin | RE485_Pin | DE485_Pin,
+        GPIO_PIN_RESET
+    );
 
-  /*Configure GPIO pins : LED_Pin RE485_Pin DE485_Pin */
-  GPIO_InitStruct.Pin = LED_Pin|RE485_Pin|DE485_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    /* Начальный уровень CS SD-карты — высокий. */
+    HAL_GPIO_WritePin(
+        SD_CARD_CS_GPIO_Port,
+        SD_CARD_CS_Pin,
+        GPIO_PIN_SET
+    );
 
-  /*Configure GPIO pin : SD_CARD_CS_Pin */
-  GPIO_InitStruct.Pin = SD_CARD_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(SD_CARD_CS_GPIO_Port, &GPIO_InitStruct);
+    /* Начальный уровень сигнала сброса GPS. */
+    HAL_GPIO_WritePin(
+        GPS_RESET_GPIO_Port,
+        GPS_RESET_Pin,
+        GPIO_PIN_RESET
+    );
 
-  /*Configure GPIO pin : PC11 */
-  GPIO_InitStruct.Pin = GPIO_PIN_11;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    /*
+     * ============================================================
+     * НОВОЕ: начальные уровни светодиодов аккумулятора.
+     *
+     * PA15 — индикатор 33%.
+     * PA12 — индикатор 66%.
+     * PA11 — индикатор 100%.
+     *
+     * Логический 0 — светодиод выключен.
+     * Логическая 1 — светодиод включён.
+     *
+     * Все три светодиода первоначально выключены.
+     * ============================================================
+     */
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15,
+        GPIO_PIN_RESET
+    );
 
-  /*Configure GPIO pin : GPS_RESET_Pin */
-  GPIO_InitStruct.Pin = GPS_RESET_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPS_RESET_GPIO_Port, &GPIO_InitStruct);
+    /*
+     * ============================================================
+     * Настройка существующих выходов GPIOC.
+     * ============================================================
+     */
+    GPIO_InitStruct.Pin = LED_Pin | RE485_Pin | DE485_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+    /*
+     * Настройка CS SD-карты.
+     */
+    GPIO_InitStruct.Pin = SD_CARD_CS_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SD_CARD_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /* USER CODE END MX_GPIO_Init_2 */
+    /*
+     * Настройка PC11 как входа.
+     * Существующую конфигурацию не изменяем.
+     */
+    GPIO_InitStruct.Pin = GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /*
+     * Настройка выхода сброса GPS.
+     */
+    GPIO_InitStruct.Pin = GPS_RESET_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPS_RESET_GPIO_Port, &GPIO_InitStruct);
+
+    /*
+     * ============================================================
+     * НОВОЕ: настройка светодиодов аккумулятора.
+     *
+     * PA11, PA12, PA15 — цифровые выходы.
+     *
+     * GPIO_MODE_OUTPUT_PP — двухтактный выход Push-Pull.
+     * GPIO_NOPULL — без внутренних подтяжек.
+     * GPIO_SPEED_FREQ_LOW — низкая скорость переключения.
+     *
+     * Настройка не затрагивает другие выводы GPIOA.
+     * ============================================================
+     */
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_15;
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+    /* USER CODE END MX_GPIO_Init_2 */
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* USER CODE BEGIN 4 */
 
