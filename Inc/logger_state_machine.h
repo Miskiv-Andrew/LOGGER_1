@@ -503,7 +503,19 @@ typedef struct
 		 * После достижения LOGGER_BATTERY_ADC_SAMPLES
 		 * вычисляется среднее напряжение.
 		 */
-		uint8_t battery_adc_count;					
+		uint8_t battery_adc_count;	
+
+		
+		/*
+		 * Повтор опроса при подготовке спектра:
+		 * 0 — повтор не требуется;
+		 * 1 — повтор GPS;
+		 * 2 — повтор LIDAR.
+		 *
+		 * Признак используется только в START_SPECTRE.
+		 */
+		uint8_t spectrum_prepare_retry;
+
 
 } LoggerStateMachine;
 

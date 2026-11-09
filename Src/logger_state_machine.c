@@ -2201,6 +2201,11 @@ void LoggerStateMachine_Init(LoggerStateMachine *logger)
 		 * пока не выполнено.
 		 */
 		logger->battery_adc_count = 0U;		
+		
+		
+		/* При запуске подготовка спектра не ожидает повтора. */
+		logger->spectrum_prepare_retry = 0U;
+
 }
 
 
@@ -2770,7 +2775,79 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 					
 								
 						if (com_info == 0U)
-						{
+						{								
+																
+								/*
+								 * ============================================================
+								 * ПОВТОР GPS/LIDAR ПРИ ПОДГОТОВКЕ СПЕКТРА
+								 * ============================================================
+								 *
+								 * После первой или второй ошибки прибора
+								 * обработчик возвращает управление в COMMAND_INFO.
+								 *
+								 * Здесь продолжаем подготовку спектра, повторяя
+								 * только тот прибор, на котором возникла ошибка.
+								 *
+								 * Команды RadioLine имеют приоритет:
+								 * при com_info != 0U этот участок не выполняется.
+								 */
+								if (logger->spectrum_prepare_retry != 0U)
+								{
+										/*
+										 * Повтор разрешён исключительно при подготовке
+										 * запуска спектра в рабочем режиме.
+										 *
+										 * После перехода в MODE_ERROR повтор запрещён.
+										 */
+										if ((logger->req_mode != MODE_WORK) ||
+												(logger->work_mode != START_SPECTRE))
+										{
+												logger->spectrum_prepare_retry = 0U;
+												break;
+										}
+
+										/*
+										 * Сохраняем требуемый прибор и сразу очищаем
+										 * признак, чтобы повтор не запускался дважды.
+										 */
+										const uint8_t retry_device =
+												logger->spectrum_prepare_retry;
+
+										logger->spectrum_prepare_retry = 0U;
+
+										/*
+										 * Повтор GPS после:
+										 * - ошибки связи с GPS;
+										 * - ошибки чтения RTC;
+										 * - обнаружения GPS-спуфинга.
+										 */
+										if (retry_device == 1U)
+										{
+												logger->dev_type = DEV_NONE;
+												logger->state = REQ_GPS;
+												break;
+										}
+
+										/*
+										 * Повтор LIDAR после:
+										 * - ошибки запуска приёма;
+										 * - таймаута;
+										 * - некорректного ответа.
+										 */
+										if (retry_device == 2U)
+										{
+												logger->dev_type = DEV_NONE;
+												logger->state = REQ_LIDAR;
+												break;
+										}
+
+										/*
+										 * Неизвестное значение уже сброшено.
+										 * Остаёмся в COMMAND_INFO.
+										 */
+										break;
+								}
+							
 								/*
 								 * ============================================================
 								 * ОЖИДАНИЕ ПОВТОРНОГО START_SPECTRE_REQ
@@ -3687,6 +3764,25 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 											logger->req_mode = MODE_ERROR;
 									}
+									
+									
+									
+									/*
+									 * Если ошибка RTC не привела к MODE_ERROR,
+									 * повторяем GPS при подготовке спектра.
+									 *
+									 * Повтор GPS необходим, чтобы получить новый
+									 * пакет координат и повторно проверить его
+									 * относительно времени RTC.
+									 *
+									 * Счётчик ошибок RTC и ID26 не изменяем.
+									 */
+									if ((logger->req_mode == MODE_WORK) &&
+											(logger->work_mode == START_SPECTRE))
+									{
+											logger->spectrum_prepare_retry = 1U;
+									}
+
 
 									/*
 									 * Не принимаем текущую GPS-координату
@@ -3735,6 +3831,22 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 												(void)RadioLine_SendPacket(24U, NULL, 0U);
 
 												logger->req_mode = MODE_ERROR;
+										}
+										
+	
+										/*
+										 * Подозрительную координату не используем.
+										 *
+										 * Если лимит спуфинга ещё не достигнут,
+										 * повторяем GPS при подготовке спектра.
+										 *
+										 * Существующий счётчик спуфинга,
+										 * отправку ID24 и MODE_ERROR не изменяем.
+										 */
+										if ((logger->req_mode == MODE_WORK) &&
+												(logger->work_mode == START_SPECTRE))
+										{
+												logger->spectrum_prepare_retry = 1U;
 										}
 
 										/*
@@ -4146,13 +4258,28 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								 * Пока предел последовательных ошибок
 								 * не достигнут, продолжаем работу.
 								 */
-								if (logger->gps_error_counter <
-										LOGGER_DEVICE_ERROR_LIMIT)
+								
+								if (logger->gps_error_counter < LOGGER_DEVICE_ERROR_LIMIT)
 								{
+										/*
+										 * Первая или вторая последовательная ошибка GPS.
+										 *
+										 * Если GPS опрашивается при подготовке спектра,
+										 * необходимо повторить его запрос.
+										 *
+										 * Существующий переход через COMMAND_INFO сохраняем.
+										 */
+										if ((logger->req_mode == MODE_WORK) &&
+												(logger->work_mode == START_SPECTRE))
+										{
+												logger->spectrum_prepare_retry = 1U;
+										}
+
 										logger->dev_type = DEV_NONE;
 										logger->state = COMMAND_INFO;
 										break;
 								}
+
 
 								/*
 								 * Достигнут предел последовательных
@@ -4542,12 +4669,27 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								 * Если предел последовательных ошибок
 								 * ещё не достигнут, продолжаем работу.
 								 */
-								if (logger->lidar_error_counter <
-										LOGGER_DEVICE_ERROR_LIMIT)
+								
+								if (logger->lidar_error_counter < LOGGER_DEVICE_ERROR_LIMIT)
 								{
+										/*
+										 * Первая или вторая последовательная ошибка LIDAR.
+										 *
+										 * GPS уже успешно обработан, поэтому повторяем
+										 * только LIDAR.
+										 *
+										 * Существующий переход через COMMAND_INFO сохраняем.
+										 */
+										if ((logger->req_mode == MODE_WORK) &&
+												(logger->work_mode == START_SPECTRE))
+										{
+												logger->spectrum_prepare_retry = 2U;
+										}
+
 										logger->state = COMMAND_INFO;
 										break;
 								}
+
 
 								/*
 								 * Достигнут предел последовательных ошибок.
