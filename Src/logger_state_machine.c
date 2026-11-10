@@ -4840,6 +4840,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             (void)HAL_TIM_Base_Stop_IT(&htim3);
             __HAL_TIM_SET_AUTORELOAD(&htim3, BDBG_RESPONSE_TIMEOUT_MS - 1U);
             __HAL_TIM_SET_COUNTER(&htim3, 0U);
+            /* Сбрасываем старый флаг обновления, чтобы таймаут отсчитывался с нуля. */
+            __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
             if (BDBG_StartRequest(&huart4, logger->bdbg_request) == 0U)
             {
                 logger->dev_type = DEV_NONE;
@@ -4847,7 +4849,19 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
                 if (logger->req_mode == MODE_TEST) (void)RadioLine_SendPacket(8U, NULL, 0U);
                 break;
             }
-            (void)HAL_TIM_Base_Start_IT(&htim3);
+            /*
+             * Запускаем TIM3. При ошибке запуска контроль
+             * времени ответа невозможен — обрабатываем так же,
+             * как ошибку отправки запроса БДБГ.
+             */
+            if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK)
+            {
+                BDBG_StopReceive();
+                logger->dev_type = DEV_NONE;
+                logger->state = (logger->req_mode == MODE_TEST) ? COMMAND_INFO : BDBG_ERROR_PROC;
+                if (logger->req_mode == MODE_TEST) (void)RadioLine_SendPacket(8U, NULL, 0U);
+                break;
+            }
             logger->state = BDBG_PROC;
             break;
         }
@@ -5683,6 +5697,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 						break;
 				}
+				
+				
 
 				case BATTERY_PROC:
 				{
@@ -5973,6 +5989,17 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 												);
 
 												/*
+												 * Записываем тот же ID25 на SD-карту.
+												 * Ошибка записи не препятствует
+												 * переходу в MODE_ERROR.
+												 */
+												(void)SD_Logger_WritePacket(
+														25U,
+														&failed_device,
+														1U
+												);
+
+												/*
 												 * Критическое напряжение подтверждено
 												 * несколькими последовательными измерениями.
 												 *
@@ -6058,9 +6085,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 * основной стейт-машины.
 						 */
 						break;
-				}		
-
-
+				}
+				
 								
 				case BATTERY_ERROR_PROC:
 				{
@@ -6232,6 +6258,17 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										);
 
 										/*
+										 * Записываем тот же ID25 на SD-карту.
+										 * Ошибка записи не препятствует
+										 * переходу в MODE_ERROR.
+										 */
+										(void)SD_Logger_WritePacket(
+												25U,
+												&failed_device,
+												1U
+										);
+
+										/*
 										 * Прекращаем рабочий режим.
 										 */
 										logger->req_mode = MODE_ERROR;
@@ -6273,99 +6310,298 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						logger->state = COMMAND_INFO;
 
 						break;
-				}			
+				}
 
 				
-				if (logger->bdbg_spectrum_stopping != 0U)
+				case WORK_SD:
 				{
 						/*
-						 * ==========================================
-						 * 1. СОХРАНЕНИЕ НАКОПЛЕННОГО СПЕКТРА
-						 * ==========================================
+						 * ========================================================
+						 * WORK_SD — РАБОТА С SD-КАРТОЙ
+						 * ========================================================
 						 *
-						 * Выполняется при штатной и аварийной
-						 * остановке, независимо от результата PAED_REQ.
+						 * MODE_TEST:
+						 *   Проверка работоспособности SD-карты.
+						 *
+						 * MODE_WORK:
+						 *   Сохранение ID22 и завершение спектрального режима.
 						 */
-						SD_LoggerResult sd_result =
-								SD_WriteAccumulatedSpectrum(logger);
 
 						/*
-						 * Не допускаем бесконечных повторов
-						 * при ошибке записи SD.
+						 * ========================================================
+						 * 1. ПРЕДПОЛЁТНАЯ ПРОВЕРКА — MODE_TEST
+						 * ========================================================
 						 */
-						(void)sd_result;
-
-						/*
-						 * ==========================================
-						 * 2. АВАРИЙНОЕ ЗАВЕРШЕНИЕ СПЕКТРА
-						 * ==========================================
-						 */
-						if (logger->bdbg_spectrum_error_shutdown != 0U)
+						if (logger->req_mode == MODE_TEST)
 						{
-								const uint8_t failed_device = 0U;
+								/*
+								 * Монтирование SD-карты уже выполнено в main.c.
+								 *
+								 * Проверяем возможность записи через временный файл:
+								 * создание -> запись -> f_sync -> закрытие -> удаление.
+								 *
+								 * Основной CSV-файл разведки не создаём.
+								 */
+								SD_LoggerResult sd_result = SD_Logger_TestWrite();
 
 								/*
-								 * ID25 отправляется здесь один раз
-								 * после попытки сохранения спектра.
+								 * SD-КАРТА НЕИСПРАВНА.
+								 */
+								if (sd_result != SD_LOGGER_OK)
+								{
+										/*
+										 * Забираем ожидающее событие ошибки SD,
+										 * чтобы не отправить ID16 повторно.
+										 */
+										(void)SD_Logger_TakeErrorEvent();
+
+										/*
+										 * ID16 — SD-карта неисправна.
+										 */
+										(void)RadioLine_SendPacket(
+												16U,
+												NULL,
+												0U
+										);
+
+										/*
+										 * MODE_TEST сохраняем.
+										 * Ожидаем решения оператора.
+										 */
+										logger->state = COMMAND_INFO;
+
+										break;
+								}
+
+								/*
+								 * SD-КАРТА ИСПРАВНА.
 								 *
-								 * Это выполняется и при успешном PAED_REQ,
-								 * и после исчерпания попыток PAED_REQ.
+								 * Тест временного файла успешно завершён.
+								 * Основной CSV-файл здесь не создаём.
+								 */
+
+								/*
+								 * ID18 — система радиационной разведки исправна.
 								 */
 								(void)RadioLine_SendPacket(
-										25U,
-										&failed_device,
-										1U
+										18U,
+										NULL,
+										0U
 								);
 
 								/*
-								 * Сохраняем сообщение об отказе БДБГ.
+								 * Предполётная проверка завершена.
+								 * Переходим в режим ожидания разведки.
 								 */
-								(void)SD_Logger_WritePacket(
-										25U,
-										&failed_device,
-										1U
-								);
+								logger->req_mode = MODE_EXPECT;
+								logger->state = COMMAND_INFO;
 
-								/*
-								 * Дальнейшая разведка запрещена.
-								 */
-								logger->req_mode = MODE_ERROR;
+								break;
 						}
 
 						/*
-						 * ==========================================
-						 * 3. ЗАВЕРШЕНИЕ СПЕКТРАЛЬНОГО РЕЖИМА
-						 * ==========================================
+						 * ========================================================
+						 * 2. ЗАВЕРШЕНИЕ СПЕКТРАЛЬНОГО РЕЖИМА
+						 * ========================================================
 						 *
-						 * Сбрасываем признаки только после
-						 * попытки сохранения спектра и ID25.
+						 * Существующую обработку ID23 не изменяем.
 						 */
-						logger->bdbg_spectrum_active = 0U;
-						logger->bdbg_spectrum_stopping = 0U;
-						logger->bdbg_spectrum_error_shutdown = 0U;
+						if (logger->bdbg_spectrum_stopping != 0U)
+						{
+								/*
+								 * ==========================================
+								 * 1. СОХРАНЕНИЕ НАКОПЛЕННОГО СПЕКТРА
+								 * ==========================================
+								 *
+								 * Выполняется при штатной и аварийной
+								 * остановке, независимо от результата PAED_REQ.
+								 */
+								SD_LoggerResult sd_result =
+										SD_WriteAccumulatedSpectrum(logger);
+
+								/*
+								 * Не допускаем бесконечных повторов
+								 * при ошибке записи SD.
+								 */
+								(void)sd_result;
+
+								/*
+								 * ==========================================
+								 * 2. АВАРИЙНОЕ ЗАВЕРШЕНИЕ СПЕКТРА
+								 * ==========================================
+								 */
+								if (logger->bdbg_spectrum_error_shutdown != 0U)
+								{
+										const uint8_t failed_device = 0U;
+
+										/*
+										 * ID25 отправляется здесь один раз
+										 * после попытки сохранения спектра.
+										 *
+										 * Это выполняется и при успешном PAED_REQ,
+										 * и после исчерпания попыток PAED_REQ.
+										 */
+										(void)RadioLine_SendPacket(
+												25U,
+												&failed_device,
+												1U
+										);
+
+										/*
+										 * Сохраняем сообщение об отказе БДБГ.
+										 */
+										(void)SD_Logger_WritePacket(
+												25U,
+												&failed_device,
+												1U
+										);
+
+										/*
+										 * Дальнейшая разведка запрещена.
+										 */
+										logger->req_mode = MODE_ERROR;
+								}
+
+								/*
+								 * ==========================================
+								 * 3. ЗАВЕРШЕНИЕ СПЕКТРАЛЬНОГО РЕЖИМА
+								 * ==========================================
+								 *
+								 * Сбрасываем признаки только после
+								 * попытки сохранения спектра и ID25.
+								 */
+								logger->bdbg_spectrum_active = 0U;
+								logger->bdbg_spectrum_stopping = 0U;
+								logger->bdbg_spectrum_error_shutdown = 0U;
+
+								/*
+								 * Восстанавливаем обычный запрос БДБГ.
+								 */
+								logger->bdbg_request = PAED_REQ;
+
+								/*
+								 * Возвращаем предыдущий рабочий режим.
+								 *
+								 * При MODE_ERROR автоматическое
+								 * выполнение измерений не возобновляется.
+								 */
+								logger->work_mode = logger->old_work_mode;
+
+								/*
+								 * Останавливаем интервал измерений.
+								 */
+								LoggerStateMachine_StopInterval(logger);
+
+								logger->state = COMMAND_INFO;
+								break;
+						}
 
 						/*
-						 * Восстанавливаем обычный запрос БДБГ.
-						 */
-						logger->bdbg_request = PAED_REQ;
-
-						/*
-						 * Возвращаем предыдущий рабочий режим.
+						 * ========================================================
+						 * 3. РАБОЧИЙ РЕЖИМ — MODE_WORK
+						 * ========================================================
 						 *
-						 * При MODE_ERROR автоматическое
-						 * выполнение измерений не возобновляется.
+						 * ID22 формируем только в режимах:
+						 * MODE_OPERATOR, MODE_TIME, MODE_DISTANCE.
 						 */
-						logger->work_mode = logger->old_work_mode;
+						if ((logger->req_mode == MODE_WORK) &&
+								((logger->work_mode == MODE_OPERATOR) ||
+								 (logger->work_mode == MODE_TIME) ||
+								 (logger->work_mode == MODE_DISTANCE)))
+						{
+								/*
+								 * Буфер полезной нагрузки ID22.
+								 * Размер фиксирован: 31 байт.
+								 */
+								uint8_t payload[ID22_PAYLOAD_SIZE];
+
+								/*
+								 * Формируем ID22 из результатов завершённого
+								 * цикла измерения.
+								 */
+								Logger_BuildID22Payload(logger, payload);
+
+								/*
+								 * ====================================================
+								 * ФИКСАЦИЯ ОПОРНОЙ ТОЧКИ ИЗМЕРЕНИЯ
+								 * ====================================================
+								 *
+								 * Сохраняем те же GPS-координаты и высоту LIDAR,
+								 * которые использованы при формировании ID22.
+								 *
+								 * Эти значения станут опорными для следующего
+								 * сравнения расстояния и высоты в MODE_DISTANCE.
+								 *
+								 * Фиксация точки не зависит от успешности
+								 * радиопередачи или записи на SD-карту.
+								 */
+
+								/*
+								 * Сохраняем GPS-координаты измеренной точки.
+								 */
+								logger->gps_data.last_saved_coord =
+										logger->gps_data.current_coord;
+
+								/*
+								 * Сохраняем высоту LIDAR измеренной точки.
+								 */
+								logger->last_saved_lidar_height_cm =
+										logger->lidar_data.distance_cm;
+
+								/*
+								 * Обе опорные величины теперь определены.
+								 * Разрешаем сравнение при следующем измерении.
+								 */
+								logger->gps_data.has_last_saved_coord = 1U;
+								logger->has_last_saved_lidar_height = 1U;
+
+								/*
+								 * ====================================================
+								 * ПЕРЕДАЧА И СОХРАНЕНИЕ ID22
+								 * ====================================================
+								 */
+
+								/*
+								 * Передаём ID22 по RadioLine.
+								 */
+								(void)RadioLine_SendPacket(
+										22U,
+										payload,
+										ID22_PAYLOAD_SIZE
+								);
+
+								/*
+								 * Сохраняем ID22 в CSV-файл.
+								 *
+								 * Ошибка записи не отменяет фиксацию
+								 * уже выполненного измерения.
+								 */
+								(void)SD_Logger_WritePacket(
+										22U,
+										payload,
+										ID22_PAYLOAD_SIZE
+								);
+
+								/*
+								 * Возвращаемся к обработке команд.
+								 */
+								logger->state = COMMAND_INFO;
+
+								break;
+						}
 
 						/*
-						 * Останавливаем интервал измерений.
+						 * ========================================================
+						 * 4. ЗАЩИТА ОТ НЕОЖИДАННОГО РЕЖИМА
+						 * ========================================================
 						 */
-						LoggerStateMachine_StopInterval(logger);
-
 						logger->state = COMMAND_INFO;
-						break;
-				}
 
+						break;
+				}			
+				
+				
+				
 				
         /*
          * Защита от некорректного состояния.
