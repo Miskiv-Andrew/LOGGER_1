@@ -18,16 +18,16 @@
 /* USER CODE END Header */
 #include "fatfs.h"
 
-#include "rtc_service.h"
-
-extern RTC_HandleTypeDef hrtc;
-
 uint8_t retUSER;    /* Return value for USER */
 char USERPath[4];   /* USER logical drive path */
 FATFS USERFatFS;    /* File system object for USER logical drive */
 FIL USERFile;       /* File object for USER */
 
 /* USER CODE BEGIN Variables */
+
+#include "rtc_service.h"
+
+extern RTC_HandleTypeDef hrtc;
 
 /* USER CODE END Variables */
 
@@ -41,6 +41,8 @@ void MX_FATFS_Init(void)
   /* USER CODE END Init */
 }
 
+
+
 /**
   * @brief  Gets Time from RTC
   * @param  None
@@ -48,6 +50,7 @@ void MX_FATFS_Init(void)
   */
 DWORD get_fattime(void)
 {
+  /* USER CODE BEGIN get_fattime */
     RTC_TimeTypeDef rtcTime = {0};
     RTC_DateTypeDef rtcDate = {0};
 
@@ -105,6 +108,7 @@ DWORD get_fattime(void)
            ((DWORD)rtcTime.Hours << 11) |
            ((DWORD)rtcTime.Minutes << 5) |
            ((DWORD)(rtcTime.Seconds / 2U));
+  /* USER CODE END get_fattime */
 }
 /* USER CODE BEGIN Application */
 
