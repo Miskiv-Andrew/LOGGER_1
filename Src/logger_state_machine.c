@@ -36,6 +36,135 @@ static uint8_t radioline_tx_buffer[RADIOLINE_TX_BUFFER_SIZE];
  */
 static uint8_t repeat_factor = LOGGER_DEFAULT_REPEAT_FACTOR;
 
+
+/*
+ * ============================================================
+ * ДАННЫЕ ОБРАБОТКИ КОМАНД ЗЕМЛЯ → ДРОН
+ * ============================================================
+ */
+
+/*
+ * Разрешение передачи в радиолинию.
+ *
+ * 1 — передача разрешена;
+ * 0 — режим радиомолчания (команда ID13).
+ *
+ * Выход из радиомолчания — команда ID14.
+ */
+static uint8_t write_radioline_flag = 1U;
+
+/*
+ * Предполётный тест остановлен на ошибке SD-карты.
+ *
+ * Устанавливается в WORK_SD (MODE_TEST) при ошибке
+ * проверки записи, сбрасывается при новом ID01.
+ *
+ * Разрешает выполнение команд ID02 и ID03.
+ */
+static uint8_t sd_test_failed = 0U;
+
+/*
+ * Цикл измерений запущен оператором командой ID10.
+ *
+ * Разрешает проверку близости точки в MODE_TIME
+ * и отправку ID21. Сбрасывается в COMMAND_INFO,
+ * то есть при любом завершении цикла.
+ */
+static uint8_t operator_measure_request = 0U;
+
+/*
+ * Команда ID08 получена во время набора спектра.
+ *
+ * После штатного завершения набора (WORK_SD)
+ * LOGGER переходит в MODE_RETURN.
+ */
+static uint8_t return_after_spectrum = 0U;
+
+/*
+ * Объекты FatFs из fatfs.c.
+ * Используются для повторного монтирования SD-карты
+ * при команде ID01.
+ */
+extern FATFS USERFatFS;
+extern char USERPath[4];
+
+/*
+ * ============================================================
+ * МАТРИЦА ДОПУСТИМОСТИ КОМАНД ПО РЕЖИМАМ
+ * ============================================================
+ *
+ * Источник: RadioLine_Command_Mode_Matrix_FULL.xlsx.
+ *
+ * Для каждой команды ID01...ID14 указаны режимы ReqMode,
+ * в которых она выполняется. Во всех остальных режимах,
+ * включая MODE_ERROR, ответ — ID03.
+ *
+ * Дополнительные условия (спектр, ошибка SD, значения
+ * Payload) проверяются в обработчике конкретной команды.
+ */
+#define LOGGER_CMD_FIRST_ID      0x01U
+#define LOGGER_CMD_LAST_ID       0x0EU
+
+#define LOGGER_MODE_BIT(mode)    ((uint8_t)(1U << (uint8_t)(mode)))
+
+static const uint8_t command_allowed_modes[LOGGER_CMD_LAST_ID + 1U] =
+{
+    [0x00U] = 0U,
+
+    /* ID01 — провести предполётное тестирование. */
+    [0x01U] = LOGGER_MODE_BIT(MODE_TEST),
+
+    /* ID02 — продолжить разведку без SD-карты. */
+    [0x02U] = LOGGER_MODE_BIT(MODE_TEST),
+
+    /* ID03 — не продолжать разведку без SD-карты. */
+    [0x03U] = LOGGER_MODE_BIT(MODE_TEST),
+
+    /* ID04 — получить параметры разведки. */
+    [0x04U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK)   |
+              LOGGER_MODE_BIT(MODE_RETURN),
+
+    /* ID05 — изменить коэффициент дублирования пакетов. */
+    [0x05U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK)   |
+              LOGGER_MODE_BIT(MODE_RETURN),
+
+    /* ID06 — изменить время между измерениями. */
+    [0x06U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID07 — изменить дистанцию между измерениями. */
+    [0x07U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID08 — закончить разведку. */
+    [0x08U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID09 — изменить режим разведки. */
+    [0x09U] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID10 — произвести измерение. */
+    [0x0AU] = LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID11 — изменить время набора спектра. */
+    [0x0BU] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID12 — прекратить набор спектра. */
+    [0x0CU] = LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID13 — перейти в режим радиомолчания. */
+    [0x0DU] = LOGGER_MODE_BIT(MODE_WORK),
+
+    /* ID14 — выйти из режима радиомолчания. */
+    [0x0EU] = LOGGER_MODE_BIT(MODE_EXPECT) |
+              LOGGER_MODE_BIT(MODE_WORK)   |
+              LOGGER_MODE_BIT(MODE_RETURN)
+};
+
 /*
  * Общий накопительный буфер RadioLine.
  *
@@ -2319,6 +2448,9 @@ extern UART_HandleTypeDef huart2;
  * Каждая копия передаётся отдельным вызовом
  * HAL_UART_Transmit() с задержкой 50 мс.
  */
+ 
+ 
+ 
 static HAL_StatusTypeDef RadioLine_SendPacket(
     uint8_t packet_id,
     const uint8_t *payload,
@@ -2338,6 +2470,16 @@ static HAL_StatusTypeDef RadioLine_SendPacket(
 
     /* Результат операции передачи USART2. */
     HAL_StatusTypeDef status;
+
+    /*
+     * Режим радиомолчания (ID13): передача в эфир запрещена.
+     * Пакет не формируется и не передаётся.
+     * Выход из молчания — команда ID14.
+     */
+    if (write_radioline_flag == 0U)
+    {
+        return HAL_OK;
+    }
 
     /*
      * Если полезные данные отсутствуют,
@@ -2545,6 +2687,16 @@ static HAL_StatusTypeDef RadioLine_SendPacket(
     /* Все копии успешно переданы. */
     return HAL_OK;
 }
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2810,9 +2962,29 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
          * Земля подтверждений не отправляет.
          * ============================================================
          */ 
+				 
+				 
+				 
+				 
+				 
+				 
+				 
+				 
+				 
+				 
 			
-				case COMMAND_INFO:
+								case COMMAND_INFO:
 				{
+						/*
+						 * Признак ручного измерения (ID10) действует только
+						 * в пределах одного цикла измерений.
+						 *
+						 * Любой цикл (успешный, с ID21, с ошибкой или
+						 * таймаутом прибора) заканчивается в COMMAND_INFO,
+						 * поэтому признак сбрасывается здесь.
+						 */
+						operator_measure_request = 0U;
+
 						/*
 						 * Ожидаем завершения приёма RadioLine.
 						 *
@@ -3060,142 +3232,117 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								break;
 						}
 
-						uint8_t start_found = 0U;
+						/*
+						 * ================================================================
+						 * ПОИСК ПЕРВОГО КОРРЕКТНОГО ПАКЕТА
+						 * ================================================================
+						 *
+						 * Пакет ищется по маркеру начала и полю Length:
+						 *
+						 *   START(4) ID(1) LENGTH(2) PAYLOAD(N) CRC16(2) END(4)
+						 *
+						 * Маркер конца проверяется на ожидаемом месте,
+						 * поэтому последовательность 0D 0A 0D 0A внутри
+						 * Payload или CRC не мешает приёму пакета.
+						 *
+						 * Остальные дубликаты в burst игнорируются.
+						 */
 						uint8_t packet_found = 0U;
-
-						uint16_t start_pos = 0U;
-						uint16_t end_pos = 0U;
 
 						uint8_t received_command = 0U;
 
-						/*
-						 * Запоминаем положение Payload и его длину.
-						 *
-						 * Эти значения понадобятся при обработке ID04.
-						 */
 						uint16_t received_payload_pos = 0U;
 						uint16_t received_payload_length = 0U;
 
-						/*
-						 * Поиск первого корректного пакета в принятом burst.
-						 *
-						 * Остальные дубликаты игнорируются.
-						 */
 						for (uint16_t i = 0U;
-								 (uint32_t)i + 3U < radioline_rx_length;
+								 ((uint32_t)i + 14U) <= radioline_rx_length;
 								 i++)
 						{
 								/*
-								 * Поиск маркера начала AA 55 AA 55.
+								 * Маркер начала AA 55 AA 55.
 								 */
-								if ((radioline_rx_buffer[i]      == 0xAAU) &&
-										(radioline_rx_buffer[i + 1U] == 0x55U) &&
-										(radioline_rx_buffer[i + 2U] == 0xAAU) &&
-										(radioline_rx_buffer[i + 3U] == 0x55U))
-								{
-										start_pos = i;
-										start_found = 1U;
-
-										i += 3U;
-
-										continue;
-								}
-
-								if (start_found == 0U)
+								if ((radioline_rx_buffer[i]      != 0xAAU) ||
+										(radioline_rx_buffer[i + 1U] != 0x55U) ||
+										(radioline_rx_buffer[i + 2U] != 0xAAU) ||
+										(radioline_rx_buffer[i + 3U] != 0x55U))
 								{
 										continue;
 								}
 
 								/*
-								 * Поиск маркера окончания 0D 0A 0D 0A.
+								 * Длина Payload (Little Endian).
+								 * Пустой Payload протоколом не допускается:
+								 * команда без данных передаёт Length = 1.
 								 */
-								if ((radioline_rx_buffer[i]      == 0x0DU) &&
-										(radioline_rx_buffer[i + 1U] == 0x0AU) &&
-										(radioline_rx_buffer[i + 2U] == 0x0DU) &&
-										(radioline_rx_buffer[i + 3U] == 0x0AU))
+								const uint16_t payload_length =
+										(uint16_t)radioline_rx_buffer[i + 5U] |
+										((uint16_t)radioline_rx_buffer[i + 6U] << 8U);
+
+								if (payload_length == 0U)
 								{
-										end_pos = i;
-
-										/*
-										 * Проверяем минимальную длину найденного фрагмента.
-										 */
-										if (((uint32_t)end_pos - start_pos) < 10U)
-										{
-												start_found = 0U;
-
-												i += 3U;
-
-												continue;
-										}
-
-										/*
-										 * Извлекаем длину Payload (Little Endian).
-										 */
-										uint16_t payload_length =
-												(uint16_t)radioline_rx_buffer[start_pos + 5U] |
-												((uint16_t)radioline_rx_buffer[start_pos + 6U] << 8U);
-
-										/*
-										 * Вычисляем фактическую длину Payload.
-										 */
-										uint16_t actual_payload_length =
-												(uint16_t)((uint32_t)end_pos -
-																	 (uint32_t)start_pos - 9U);
-
-										if ((payload_length == 0U) ||
-												(payload_length != actual_payload_length))
-										{
-												start_found = 0U;
-
-												i += 3U;
-
-												continue;
-										}
-
-										/*
-										 * Извлекаем принятую CRC16 (Little Endian).
-										 */
-										uint16_t received_crc =
-												(uint16_t)radioline_rx_buffer[end_pos - 2U] |
-												((uint16_t)radioline_rx_buffer[end_pos - 1U] << 8U);
-
-										/*
-										 * Вычисляем CRC16 по Command ID, Length и Payload.
-										 */
-										uint16_t calculated_crc =
-												calculateCrc16(
-														&radioline_rx_buffer[start_pos + 4U],
-														(uint16_t)(3U + payload_length)
-												);
-
-										if (received_crc != calculated_crc)
-										{
-												start_found = 0U;
-
-												i += 3U;
-
-												continue;
-										}
-
-										/*
-										 * Первый корректный пакет найден.
-										 *
-										 * Сохраняем его идентификатор и расположение Payload.
-										 */
-										received_command = radioline_rx_buffer[start_pos + 4U];
-
-										received_payload_pos = (uint16_t)(start_pos + 7U);
-										received_payload_length = payload_length;
-
-										packet_found = 1U;
-
-										break;
+										continue;
 								}
+
+								/*
+								 * Полная длина пакета: 4 + 1 + 2 + N + 2 + 4.
+								 * Пакет должен целиком находиться в буфере.
+								 */
+								const uint32_t packet_size =
+										13U + (uint32_t)payload_length;
+
+								if (((uint32_t)i + packet_size) >
+										(uint32_t)radioline_rx_length)
+								{
+										continue;
+								}
+
+								const uint32_t crc_pos =
+										(uint32_t)i + 7U + (uint32_t)payload_length;
+
+								const uint32_t end_pos = crc_pos + 2U;
+
+								/*
+								 * Маркер конца 0D 0A 0D 0A на ожидаемом месте.
+								 */
+								if ((radioline_rx_buffer[end_pos]      != 0x0DU) ||
+										(radioline_rx_buffer[end_pos + 1U] != 0x0AU) ||
+										(radioline_rx_buffer[end_pos + 2U] != 0x0DU) ||
+										(radioline_rx_buffer[end_pos + 3U] != 0x0AU))
+								{
+										continue;
+								}
+
+								/*
+								 * CRC16 по полям ID + LENGTH + PAYLOAD.
+								 */
+								const uint16_t received_crc =
+										(uint16_t)radioline_rx_buffer[crc_pos] |
+										((uint16_t)radioline_rx_buffer[crc_pos + 1U] << 8U);
+
+								const uint16_t calculated_crc =
+										calculateCrc16(
+												&radioline_rx_buffer[i + 4U],
+												(uint16_t)(3U + payload_length)
+										);
+
+								if (received_crc != calculated_crc)
+								{
+										continue;
+								}
+
+								/*
+								 * Первый корректный пакет найден.
+								 */
+								received_command = radioline_rx_buffer[i + 4U];
+								received_payload_pos = (uint16_t)(i + 7U);
+								received_payload_length = payload_length;
+								packet_found = 1U;
+
+								break;
 						}
 
 						/*
 						 * Освобождаем накопительный буфер.
-						 *
 						 * Его содержимое остаётся доступным до следующего приёма.
 						 */
 						radioline_rx_length = 0U;
@@ -3203,7 +3350,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						if (packet_found == 0U)
 						{
 								/*
-								 * Корректный пакет не найден.
+								 * ID02 — пакет не принят:
+								 * корректный пакет не найден.
 								 */
 								(void)RadioLine_SendPacket(0x02U, NULL, 0U);
 
@@ -3211,317 +3359,711 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						}
 
 						/*
-						 * Пакет успешно прошёл проверку структуры и CRC16.
-						 *
-						 * ID01 подтверждает именно приём радиопакета,
-						 * а не успешное применение его параметров.
-						 */
-						(void)RadioLine_SendPacket(0x01U, NULL, 0U);
-
-						/*
 						 * ================================================================
-						 * Команда ID01 — предполётное тестирование.
-						 *
-						 * Сохраняем существующий алгоритм без изменений.
+						 * ПРОВЕРКА КОМАНДЫ ПО МАТРИЦЕ
 						 * ================================================================
+						 *
+						 * Правила ответа:
+						 *
+						 *   ID02 — неизвестная команда или неверный Payload
+						 *          (длина или значение);
+						 *   ID03 — команда запрещена в текущем режиме
+						 *          или не выполнено дополнительное условие;
+						 *   ID01 — команда принята и выполнена.
+						 *
+						 * ID01 отправляется только после всех проверок.
 						 */
-						if ((logger->req_mode == MODE_TEST) &&
-								(received_command == 0x01U))
+						if ((received_command < LOGGER_CMD_FIRST_ID) ||
+								(received_command > LOGGER_CMD_LAST_ID))
 						{
-								logger->state = REQ_GPS;
+								(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+
+								break;
+						}
+
+						if ((command_allowed_modes[received_command] &
+								 LOGGER_MODE_BIT(logger->req_mode)) == 0U)
+						{
+								/*
+								 * ID03 — в текущем режиме команда не выполняется.
+								 */
+								(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+
+								break;
 						}
 
 						/*
-						 * ================================================================
-						 * Команда ID04 — параметры радиационной разведки.
-						 *
-						 * Разбираем Payload только после проверки CRC16.
-						 *
-						 * Формат:
-						 *
-						 * pointCount    uint8_t
-						 * points[]      pointCount * (float lat + float lon)
-						 * mode          uint8_t
-						 * saveTime      uint16_t
-						 * saveDistance  uint16_t
-						 * duplCoeff     uint8_t
-						 * saveSpectre   uint16_t
-						 *
-						 * Все многобайтовые значения передаются Little Endian.
-						 * ================================================================
+						 * Указатель на Payload принятой команды.
 						 */
-						if (received_command == 0x04U)
+						const uint8_t *cmd_payload =
+								&radioline_rx_buffer[received_payload_pos];
+
+						/*
+						 * Команда без данных: Length = 1, Payload = 0x01.
+						 */
+						const uint8_t cmd_default_payload =
+								((received_payload_length == 1U) &&
+								 (cmd_payload[0] == 0x01U)) ? 1U : 0U;
+
+						/*
+						 * Значение uint16_t для команд ID06, ID07, ID11.
+						 */
+						const uint16_t cmd_value16 =
+								(received_payload_length == 2U) ?
+								(uint16_t)((uint16_t)cmd_payload[0] |
+										   ((uint16_t)cmd_payload[1] << 8U)) : 0U;
+
+						/*
+						 * Признак текущей работы со спектром:
+						 * подготовка запуска, набор или его завершение.
+						 */
+						const uint8_t spectrum_busy =
+								((logger->work_mode == START_SPECTRE) ||
+								 (logger->work_mode == MODE_SPECTRE) ||
+								 (logger->bdbg_spectrum_active != 0U) ||
+								 (logger->bdbg_spectrum_stopping != 0U)) ? 1U : 0U;
+
+						switch (received_command)
 						{
 								/*
-								 * Минимальная длина Payload при трёх вершинах:
-								 *
-								 * 1 + 3 * 8 + 1 + 2 + 2 + 1 + 2 = 33 байта.
+								 * ========================================================
+								 * ID01 — ПРОВЕСТИ ПРЕДПОЛЁТНОЕ ТЕСТИРОВАНИЕ
+								 * ========================================================
+								 * Режим: MODE_TEST.
 								 */
-								if (received_payload_length >=
-										(uint16_t)(9U + 8U * LOGGER_MIN_AREA_POINTS))
+								case 0x01U:
 								{
-										const uint8_t *payload =
-												&radioline_rx_buffer[received_payload_pos];
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
 
-										uint8_t point_count = payload[0];
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
 
 										/*
-										 * Проверяем допустимое количество вершин.
+										 * Новый тест: прежний результат проверки SD
+										 * больше не действует.
 										 */
-										if ((point_count >= LOGGER_MIN_AREA_POINTS) &&
-												(point_count <= LOGGER_MAX_AREA_POINTS))
+										sd_test_failed = 0U;
+
+										/*
+										 * Повторно монтируем SD-карту.
+										 * Это позволяет заменить или вставить карту
+										 * после ID16 и повторить тест без перезагрузки.
+										 *
+										 * Результат проверяется в WORK_SD,
+										 * поэтому событие ошибки монтирования
+										 * забираем здесь, чтобы не отправить ID16
+										 * до окончания теста.
+										 */
+										SD_Logger_SetMountResult(
+												f_mount(&USERFatFS, USERPath, 1U)
+										);
+
+										(void)SD_Logger_TakeErrorEvent();
+
+										logger->state = REQ_GPS;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID02 — ПРОДОЛЖИТЬ РАЗВЕДКУ БЕЗ SD-КАРТЫ
+								 * ========================================================
+								 * Режим: MODE_TEST.
+								 * Условие: тест остановлен на ошибке SD-карты.
+								 * К этому моменту GPS, LIDAR, БДБГ и батарея
+								 * уже прошли проверку.
+								 */
+								case 0x02U:
+								{
+										if (cmd_default_payload == 0U)
 										{
-												/*
-												 * Проверяем точную длину Payload.
-												 *
-												 * Это исключает чтение за пределами пакета.
-												 */
-												uint16_t expected_length =
-														(uint16_t)(9U + 8U * point_count);
-
-												if (received_payload_length == expected_length)
-												{
-														/*
-														 * Временная структура фиксированного размера.
-														 *
-														 * До завершения проверки действующая
-														 * конфигурация LOGGER не изменяется.
-														 */
-														FlightConfig new_config = {0};
-
-														uint16_t offset = 1U;
-
-														new_config.pointCount = point_count;
-
-														/*
-														 * Копируем координаты по 4 байта.
-														 *
-														 * memcpy исключает нарушение требований
-														 * выравнивания при чтении float.
-														 *
-														 * Формат float на STM32 — IEEE-754,
-														 * порядок байтов Little Endian.
-														 */
-														for (uint8_t p = 0U; p < point_count; p++)
-														{
-																memcpy(&new_config.points[p].lat,
-																			 &payload[offset],
-																			 sizeof(float));
-
-																offset += (uint16_t)sizeof(float);
-
-																memcpy(&new_config.points[p].lon,
-																			 &payload[offset],
-																			 sizeof(float));
-
-																offset += (uint16_t)sizeof(float);
-														}
-
-														/*
-														 * Режим разведки.
-														 */
-														new_config.mode = payload[offset];
-														offset++;
-
-														/*
-														 * Интервал сохранения, секунды.
-														 */
-														new_config.saveTime =
-																(uint16_t)payload[offset] |
-																((uint16_t)payload[offset + 1U] << 8U);
-
-														offset += 2U;
-
-														/*
-														 * Минимальная дистанция сохранения, метры.
-														 */
-														new_config.saveDistance =
-																(uint16_t)payload[offset] |
-																((uint16_t)payload[offset + 1U] << 8U);
-
-														offset += 2U;
-
-														/*
-														 * Коэффициент дублирования радиопакетов.
-														 */
-														new_config.duplCoeff = payload[offset];
-														offset++;
-
-														/*
-														 * Время набора спектра, секунды.
-														 */
-														new_config.saveSpectre =
-																(uint16_t)payload[offset] |
-																((uint16_t)payload[offset + 1U] << 8U);
-
-														/*
-														 * Проверяем допустимые значения.
-														 *
-														 * Режимы ID04:
-														 * 0 — операторский;
-														 * 1 — по времени;
-														 * 2 — по расстоянию;
-														 */
-														if ((new_config.mode <= 2U) && (new_config.saveTime > 0U) && (new_config.saveDistance > 0U) && (new_config.duplCoeff >= LOGGER_MIN_REPEAT_FACTOR) && (new_config.duplCoeff <= LOGGER_MAX_REPEAT_FACTOR))
-														{
-																/*
-																 * Все проверки завершены.
-																 *
-																 * Заменяем действующую конфигурацию
-																 * одним присваиванием структуры.
-																 *
-																 * Массив точек копируется вместе
-																 * с остальными полями.
-																 */
-																logger->flight_config = new_config;
-
-																/*
-																 * Режим работы и переходы состояний
-																 * здесь не изменяем.
-																 *
-																 * Применение параметров будет выполнено
-																 * в соответствующих состояниях
-																 * утверждённой стейт-машины.
-																 */
-														}
-												}
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
 										}
+
+										if (sd_test_failed == 0U)
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										/*
+										 * Запись на SD уже запрещена модулем sd_logger
+										 * после ошибки проверки. Продолжаем без записи.
+										 */
+										sd_test_failed = 0U;
+
+										logger->req_mode = MODE_EXPECT;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID03 — НЕ ПРОДОЛЖАТЬ РАЗВЕДКУ БЕЗ SD-КАРТЫ
+								 * ========================================================
+								 * Режим: MODE_TEST.
+								 * Условие: тест остановлен на ошибке SD-карты.
+								 * Остаёмся в MODE_TEST и ждём повторного ID01.
+								 */
+								case 0x03U:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										if (sd_test_failed == 0U)
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID04 — ПАРАМЕТРЫ РАДИАЦИОННОЙ РАЗВЕДКИ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK, MODE_RETURN.
+								 *
+								 * Формат:
+								 *   pointCount    uint8_t
+								 *   points[]      pointCount * (float lat + float lon)
+								 *   mode          uint8_t
+								 *   saveTime      uint16_t
+								 *   saveDistance  uint16_t
+								 *   duplCoeff     uint8_t
+								 *   saveSpectre   uint16_t
+								 *
+								 * Применение конфигурации (смена территории)
+								 * будет переделано на этапе B.
+								 */
+								case 0x04U:
+								{
+										/*
+										 * Минимальная длина Payload при трёх вершинах:
+										 * 1 + 3 * 8 + 1 + 2 + 2 + 1 + 2 = 33 байта.
+										 */
+										if (received_payload_length <
+												(uint16_t)(9U + 8U * LOGGER_MIN_AREA_POINTS))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										const uint8_t point_count = cmd_payload[0];
+
+										/*
+										 * Количество вершин и точная длина Payload.
+										 */
+										if ((point_count < LOGGER_MIN_AREA_POINTS) ||
+												(point_count > LOGGER_MAX_AREA_POINTS) ||
+												(received_payload_length !=
+												 (uint16_t)(9U + 8U * point_count)))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										FlightConfig new_config = {0};
+
+										uint16_t offset = 1U;
+
+										new_config.pointCount = point_count;
+
+										/*
+										 * Координаты по 4 байта, float IEEE-754,
+										 * Little Endian. memcpy исключает нарушение
+										 * выравнивания.
+										 */
+										for (uint8_t p = 0U; p < point_count; p++)
+										{
+												memcpy(&new_config.points[p].lat,
+														   &cmd_payload[offset],
+														   sizeof(float));
+
+												offset += (uint16_t)sizeof(float);
+
+												memcpy(&new_config.points[p].lon,
+														   &cmd_payload[offset],
+														   sizeof(float));
+
+												offset += (uint16_t)sizeof(float);
+										}
+
+										new_config.mode = cmd_payload[offset];
+										offset++;
+
+										new_config.saveTime =
+												(uint16_t)cmd_payload[offset] |
+												((uint16_t)cmd_payload[offset + 1U] << 8U);
+										offset += 2U;
+
+										new_config.saveDistance =
+												(uint16_t)cmd_payload[offset] |
+												((uint16_t)cmd_payload[offset + 1U] << 8U);
+										offset += 2U;
+
+										new_config.duplCoeff = cmd_payload[offset];
+										offset++;
+
+										new_config.saveSpectre =
+												(uint16_t)cmd_payload[offset] |
+												((uint16_t)cmd_payload[offset + 1U] << 8U);
+
+										/*
+										 * Режимы ID04: 0 — операторский,
+										 * 1 — по времени, 2 — по расстоянию.
+										 * Спектр в ID04 не допускается.
+										 */
+										if ((new_config.mode > 2U) ||
+												(new_config.saveTime == 0U) ||
+												(new_config.saveDistance == 0U) ||
+												(new_config.duplCoeff < LOGGER_MIN_REPEAT_FACTOR) ||
+												(new_config.duplCoeff > LOGGER_MAX_REPEAT_FACTOR))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										/*
+										 * Заменяем действующую конфигурацию
+										 * одним присваиванием структуры.
+										 */
+										logger->flight_config = new_config;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID05 — ИЗМЕНИТЬ КОЭФФИЦИЕНТ ДУБЛИРОВАНИЯ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK, MODE_RETURN.
+								 * Payload: uint8_t, 2...5.
+								 */
+								case 0x05U:
+								{
+										if ((received_payload_length != 1U) ||
+												(cmd_payload[0] < LOGGER_MIN_REPEAT_FACTOR) ||
+												(cmd_payload[0] > LOGGER_MAX_REPEAT_FACTOR))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										repeat_factor = cmd_payload[0];
+										logger->flight_config.duplCoeff = cmd_payload[0];
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID06 — ИЗМЕНИТЬ ВРЕМЯ МЕЖДУ ИЗМЕРЕНИЯМИ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK.
+								 * Payload: uint16_t, секунды, больше 0.
+								 */
+								case 0x06U:
+								{
+										if ((received_payload_length != 2U) ||
+												(cmd_value16 == 0U))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										logger->flight_config.saveTime = cmd_value16;
+
+										/*
+										 * Новый интервал действует сразу:
+										 * отсчёт начинается заново.
+										 */
+										LoggerStateMachine_StopInterval(logger);
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID07 — ИЗМЕНИТЬ ДИСТАНЦИЮ МЕЖДУ ИЗМЕРЕНИЯМИ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK.
+								 * Payload: uint16_t, метры, больше 0.
+								 */
+								case 0x07U:
+								{
+										if ((received_payload_length != 2U) ||
+												(cmd_value16 == 0U))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										logger->flight_config.saveDistance = cmd_value16;
+
+										LoggerStateMachine_StopInterval(logger);
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID08 — ЗАКОНЧИТЬ РАЗВЕДКУ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK.
+								 *
+								 * Во время набора спектра сначала штатно
+								 * останавливаем набор (PAED_REQ → WORK_SD,
+								 * запись ID23), затем WORK_SD переводит
+								 * LOGGER в MODE_RETURN.
+								 */
+								case 0x08U:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										/*
+										 * Идёт набор спектра или его завершение.
+										 */
+										if ((logger->req_mode == MODE_WORK) &&
+												((logger->bdbg_spectrum_active != 0U) ||
+												 (logger->bdbg_spectrum_stopping != 0U)))
+										{
+												return_after_spectrum = 1U;
+
+												if (logger->bdbg_spectrum_stopping == 0U)
+												{
+														logger->bdbg_spectrum_stopping = 1U;
+														logger->bdbg_request = PAED_REQ;
+														logger->state = REQ_BDBG;
+												}
+
+												break;
+										}
+
+										/*
+										 * Идёт подготовка запуска спектра:
+										 * прибор набор ещё не начал.
+										 * Отменяем повторы и возвращаем режим.
+										 */
+										if (logger->work_mode == START_SPECTRE)
+										{
+												logger->bdbg_start_retry_pending = 0U;
+												logger->bdbg_start_retry_tick = 0U;
+												logger->spectrum_prepare_retry = 0U;
+
+												logger->work_mode = logger->old_work_mode;
+												logger->bdbg_request = PAED_REQ;
+										}
+
+										logger->req_mode = MODE_RETURN;
+
+										LoggerStateMachine_StopInterval(logger);
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID09 — ИЗМЕНИТЬ РЕЖИМ РАЗВЕДКИ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT (0...2), MODE_WORK (0...3).
+								 * Не выполняется во время старта и набора спектра.
+								 *
+								 * Payload:
+								 *   0 — операторский режим;
+								 *   1 — по времени;
+								 *   2 — по расстоянию;
+								 *   3 — запуск набора спектра.
+								 */
+								case 0x09U:
+								{
+										if ((received_payload_length != 1U) ||
+												(cmd_payload[0] > 3U))
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										const uint8_t requested_mode = cmd_payload[0];
+
+										if ((spectrum_busy != 0U) ||
+												((logger->req_mode == MODE_EXPECT) &&
+												 (requested_mode == 3U)))
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										/*
+										 * MODE_EXPECT: режим запоминается
+										 * и начнёт действовать после входа в область.
+										 */
+										if (logger->req_mode == MODE_EXPECT)
+										{
+												logger->old_work_mode = logger->work_mode;
+												logger->work_mode = (DroneWorkMode)requested_mode;
+												logger->flight_config.mode = requested_mode;
+												break;
+										}
+
+										/*
+										 * MODE_WORK, обычный режим разведки.
+										 */
+										if (requested_mode <= 2U)
+										{
+												logger->work_mode = (DroneWorkMode)requested_mode;
+												logger->flight_config.mode = requested_mode;
+
+												LoggerStateMachine_StopInterval(logger);
+
+												/*
+												 * MODE_TIME и MODE_DISTANCE:
+												 * текущая точка становится стартовой
+												 * для отсчёта времени или расстояния.
+												 */
+												if ((requested_mode == (uint8_t)MODE_TIME) ||
+														(requested_mode == (uint8_t)MODE_DISTANCE))
+												{
+														logger->state = REQ_GPS;
+												}
+
+												break;
+										}
+
+										/*
+										 * MODE_WORK, запуск набора спектра.
+										 *
+										 * Сохраняем текущий режим для возврата
+										 * после завершения спектра.
+										 */
+										logger->old_work_mode = logger->work_mode;
+
+										LoggerStateMachine_StopInterval(logger);
+
+										logger->work_mode = START_SPECTRE;
+
+										logger->bdbg_spectrum_active = 0U;
+										logger->bdbg_spectrum_stopping = 0U;
+										logger->bdbg_spectrum_error_shutdown = 0U;
+
+										/*
+										 * Координаты и высота нового спектра
+										 * будут зафиксированы в LIDAR_PROC.
+										 */
+										logger->spectrum_start_data_valid = 0U;
+
+										/*
+										 * Запрос БДБГ будет отправлен после
+										 * получения GPS и LIDAR.
+										 */
+										logger->bdbg_request = START_SPECTRE_REQ;
+
+										logger->spectrum_prepare_retry = 0U;
+
+										/*
+										 * GPS → LIDAR → START_SPECTRE_REQ.
+										 */
+										logger->state = REQ_GPS;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID10 — ПРОИЗВЕСТИ ИЗМЕРЕНИЕ
+								 * ========================================================
+								 * Режим: MODE_WORK
+								 * (MODE_OPERATOR, MODE_TIME, MODE_DISTANCE).
+								 * Не выполняется во время старта и набора спектра.
+								 *
+								 * Признак operator_measure_request:
+								 *   - разрешает проверку близости точки
+								 *     в MODE_TIME;
+								 *   - разрешает ответ ID21;
+								 *   - сбрасывается при возврате в COMMAND_INFO.
+								 */
+								case 0x0AU:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										if ((spectrum_busy != 0U) ||
+												((logger->work_mode != MODE_OPERATOR) &&
+												 (logger->work_mode != MODE_TIME) &&
+												 (logger->work_mode != MODE_DISTANCE)))
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										operator_measure_request = 1U;
+
+										/*
+										 * После измерения отсчёт интервала
+										 * начнётся заново от этой точки.
+										 */
+										LoggerStateMachine_StopInterval(logger);
+
+										logger->state = REQ_GPS;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID11 — ИЗМЕНИТЬ ВРЕМЯ НАБОРА СПЕКТРА
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK.
+								 * Не выполняется во время старта и набора спектра.
+								 * Payload: uint16_t, секунды; 0 — до команды ID12.
+								 */
+								case 0x0BU:
+								{
+										if (received_payload_length != 2U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										if (spectrum_busy != 0U)
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										logger->flight_config.saveSpectre = cmd_value16;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID12 — ПРЕКРАТИТЬ НАБОР СПЕКТРА
+								 * ========================================================
+								 * Режим: MODE_WORK.
+								 * Условие: идёт набор спектра.
+								 * Остановка штатной командой PAED_REQ.
+								 */
+								case 0x0CU:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										if ((logger->work_mode != MODE_SPECTRE) ||
+												(logger->bdbg_spectrum_active == 0U) ||
+												(logger->bdbg_spectrum_stopping != 0U))
+										{
+												(void)RadioLine_SendPacket(0x03U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										logger->bdbg_spectrum_stopping = 1U;
+										logger->bdbg_request = PAED_REQ;
+										logger->state = REQ_BDBG;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID13 — ПЕРЕЙТИ В РЕЖИМ РАДИОМОЛЧАНИЯ
+								 * ========================================================
+								 * Режим: MODE_WORK.
+								 * Сначала подтверждение, затем молчание.
+								 */
+								case 0x0DU:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+
+										write_radioline_flag = 0U;
+										break;
+								}
+
+								/*
+								 * ========================================================
+								 * ID14 — ВЫЙТИ ИЗ РЕЖИМА РАДИОМОЛЧАНИЯ
+								 * ========================================================
+								 * Режимы: MODE_EXPECT, MODE_WORK, MODE_RETURN.
+								 * Сначала включаем передачу, затем подтверждение.
+								 */
+								case 0x0EU:
+								{
+										if (cmd_default_payload == 0U)
+										{
+												(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+												break;
+										}
+
+										write_radioline_flag = 1U;
+
+										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
+										break;
+								}
+
+								default:
+								{
+										(void)RadioLine_SendPacket(0x02U, NULL, 0U);
+										break;
 								}
 						}
 
-
-                        
-												/*
-												 * ============================================================
-												 * ID09 — изменение режима радиационной разведки.
-												 *
-												 * Payload:
-												 * 0 — операторский режим;
-												 * 1 — режим по времени;
-												 * 2 — режим по расстоянию;
-												 * 3 — запуск набора спектра.
-												 * ============================================================
-												 */
-												if ((received_command == 0x09U) &&
-														(received_payload_length == 1U) &&
-														(logger->req_mode == MODE_WORK))
-												{
-														const uint8_t requested_mode =
-																radioline_rx_buffer[received_payload_pos];
-
-														/*
-														 * Не прерываем активный или уже запускаемый спектр.
-														 */
-														if ((logger->bdbg_spectrum_active == 0U) &&
-																(logger->bdbg_spectrum_stopping == 0U) &&
-																(logger->work_mode != START_SPECTRE) &&
-																(logger->work_mode != MODE_SPECTRE))
-														{
-																if (requested_mode <= 2U)
-																{
-																		/*
-																		 * Обычный режим разведки.
-																		 *
-																		 * Устанавливаем новый режим и начинаем
-																		 * новый интервал измерений.
-																		 */
-																		logger->work_mode =
-																				(DroneWorkMode)requested_mode;
-
-																		LoggerStateMachine_StopInterval(logger);
-																}
-																else if (requested_mode == 3U)
-																{
-																		/*
-																		 * Запрошено начало набора спектра.
-																		 *
-																		 * Сохраняем текущий рабочий режим,
-																		 * чтобы восстановить его после
-																		 * завершения спектрального измерения.
-																		 */
-																		logger->old_work_mode = logger->work_mode;
-
-																		/*
-																		 * Останавливаем текущий интервал измерений.
-																		 */
-																		LoggerStateMachine_StopInterval(logger);
-
-																		/*
-																		 * Переходим в промежуточный режим
-																		 * подготовки запуска спектра.
-																		 */
-																		logger->work_mode = START_SPECTRE;
-
-																		/*
-																		 * Новый набор ещё не запущен.
-																		 */
-																		logger->bdbg_spectrum_active = 0U;
-																		logger->bdbg_spectrum_stopping = 0U;
-																		logger->bdbg_spectrum_error_shutdown = 0U;
-
-																		/*
-																		 * Сбрасываем признак достоверности
-																		 * координат и высоты нового спектра.
-																		 *
-																		 * Он будет установлен в LIDAR_PROC
-																		 * после успешного получения данных.
-																		 */
-																		logger->spectrum_start_data_valid = 0U;
-
-																		/*
-																		 * Подготавливаем будущий запрос БДБГ.
-																		 *
-																		 * Сейчас его НЕ отправляем.
-																		 */
-																		logger->bdbg_request = START_SPECTRE_REQ;
-																		
-																		/*
-																		 * Начинается новая подготовка спектра.
-																		 *
-																		 * Сбрасываем признак повторного опроса GPS/LIDAR,
-																		 * чтобы не использовать состояние предыдущей попытки.
-																		 */
-																		logger->spectrum_prepare_retry = 0U;
-
-
-																		/*
-																		 * Сначала запрашиваем GPS.
-																		 *
-																		 * После успешного GPS:
-																		 * REQ_LIDAR -> LIDAR_PROC.
-																		 *
-																		 * В LIDAR_PROC будут сохранены
-																		 * координаты и высота начала спектра.
-																		 *
-																		 * Только затем будет выполнен
-																		 * переход в REQ_BDBG.
-																		 */
-																		logger->state = REQ_GPS;
-																}
-														}
-												}
-
-
-                        /*
-                         * ID12: досрочная остановка набора спектра.
-                         * Payload должен содержать ровно один байт 0x01.
-                         */
-                        if ((received_command == 0x0CU) &&
-                            (received_payload_length == 1U) &&
-                            (radioline_rx_buffer[received_payload_pos] == 0x01U) &&
-                            (logger->req_mode == MODE_WORK) &&
-                            (logger->work_mode == MODE_SPECTRE) &&
-                            (logger->bdbg_spectrum_active != 0U) &&
-                            (logger->bdbg_spectrum_stopping == 0U))
-                        {
-                            /* Останавливаем прибор штатной командой PAED_REQ. */
-                            logger->bdbg_spectrum_stopping = 1U;
-                            logger->bdbg_request = PAED_REQ;
-                            logger->state = REQ_BDBG;
-                        }
-
 						break;
 				}
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				
 								 
 
         /*
@@ -4520,14 +5062,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 					logger->state = LIDAR_PROC;
 
 					break;
-			}		
+			}			
 				
-				
-        /* ============================================================
-         * LIDAR_PROC — обработка завершённого DMA-приёма LIDAR.
-         * Ожидание неблокирующее; таймаут обрабатывается отдельно.
-         * ============================================================ */
-        case LIDAR_PROC:
+         case LIDAR_PROC:
         {
             LIDAR_Data measurement;
 
@@ -4594,8 +5131,13 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
                 break;
             }
 
-            /* MODE_TIME: интервал уже проверен, измерение необходимо. */
-            if (logger->work_mode == MODE_TIME)
+            /*
+             * MODE_TIME: интервал уже проверен, измерение необходимо.
+             * Если цикл запущен оператором (ID10), точка сначала
+             * сравнивается с последней сохранённой — ниже,
+             * вместе с MODE_OPERATOR и MODE_DISTANCE.
+             */
+            if ((logger->work_mode == MODE_TIME) && (operator_measure_request == 0U))
             {
                 logger->bdbg_request = PAED_REQ;
                 logger->state = REQ_BDBG;
@@ -4644,7 +5186,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
                 break;
             }
 
-            if ((logger->work_mode == MODE_OPERATOR) || (logger->work_mode == MODE_DISTANCE))
+            if ((logger->work_mode == MODE_OPERATOR) ||
+                (logger->work_mode == MODE_DISTANCE) ||
+                (logger->work_mode == MODE_TIME))
             {
                 /* Первое измерение выполняется без сравнения с сохранённой точкой. */
                 if ((logger->gps_data.has_last_saved_coord == 0U) ||
@@ -4673,11 +5217,12 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
                 }
                 else
                 {
-                    /* В операторском режиме сообщаем, что точка уже измерена.
-                     * ID21 — «Измерения для данной точки уже проведены».
-                     * NULL, 0U — стандартный Payload по умолчанию.
-                     * В MODE_DISTANCE сообщение не отправляем. */
-                    if (logger->work_mode == MODE_OPERATOR)
+                    /* ID21 — «Измерения для данной точки уже проведены».
+                     * Отправляется только если цикл запущен оператором
+                     * командой ID10. При автоматическом запуске цикла
+                     * (MODE_TIME / MODE_DISTANCE) сообщение не отправляем.
+                     * NULL, 0U — стандартный Payload по умолчанию. */
+                    if (operator_measure_request != 0U)
                     {
                         (void)RadioLine_SendPacket(21U, NULL, 0U);
                     }
@@ -4689,7 +5234,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
             /* Защита от неизвестного рабочего подрежима. */
             logger->state = COMMAND_INFO;
             break;
-        }	
+        }		
+				
+				
 
         
 				case LIDAR_ERROR_PROC:
@@ -6311,9 +6858,14 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 						break;
 				}
+				
+				
+				
+				
+				
 
 				
-				case WORK_SD:
+								case WORK_SD:
 				{
 						/*
 						 * ========================================================
@@ -6354,6 +6906,12 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										 * чтобы не отправить ID16 повторно.
 										 */
 										(void)SD_Logger_TakeErrorEvent();
+
+										/*
+										 * Тест остановлен на SD-карте.
+										 * Разрешаем команды ID02 / ID03.
+										 */
+										sd_test_failed = 1U;
 
 										/*
 										 * ID16 — SD-карта неисправна.
@@ -6488,6 +7046,19 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								logger->work_mode = logger->old_work_mode;
 
 								/*
+								 * ID08 во время набора спектра:
+								 * после сохранения спектра переходим в MODE_RETURN.
+								 * При MODE_ERROR режим не меняем.
+								 */
+								if ((return_after_spectrum != 0U) &&
+										(logger->req_mode != MODE_ERROR))
+								{
+										logger->req_mode = MODE_RETURN;
+								}
+
+								return_after_spectrum = 0U;
+
+								/*
 								 * Останавливаем интервал измерений.
 								 */
 								LoggerStateMachine_StopInterval(logger);
@@ -6598,9 +7169,8 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						logger->state = COMMAND_INFO;
 
 						break;
-				}			
-				
-				
+				}
+			
 				
 				
         /*
