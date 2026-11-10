@@ -64,7 +64,7 @@ extern volatile uint8_t device_timeout;
  * в режимах MODE_EXPECT и MODE_RETURN.
  * Единица измерения — секунды.
  */
-#define LOGGER_ROUTE_GPS_INTERVAL_S 10U
+#define LOGGER_ROUTE_GPS_INTERVAL_S 60U
 
 /*
  * Интервал периодического запроса GPS

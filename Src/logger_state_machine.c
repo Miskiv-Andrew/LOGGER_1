@@ -2849,8 +2849,10 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 							1U
 					);
 			}
+					
+			
 
-		#ifdef DEBUG_MODE
+		 #ifdef DEBUG_MODE
 		/*
 		 * Запоминаем состояние, для которого
 		 * уже отправлено DEBUG-сообщение.
@@ -2893,6 +2895,76 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 */
 						(void)RadioLine_SendPacket(80U, NULL, 0U);
 				}
+				else if (logger->state == REQ_BATTERY)
+				{
+						/*
+						 * Сообщение о входе в REQ_BATTERY.
+						 */
+						(void)RadioLine_SendPacket(71U, NULL, 0U);
+				}
+				else if (logger->state == BATTERY_PROC)
+				{
+						/*
+						 * Сообщение о входе в BATTERY_PROC.
+						 */
+						(void)RadioLine_SendPacket(72U, NULL, 0U);
+				}
+				else if (logger->state == BATTERY_ERROR_PROC)
+				{
+						/*
+						 * Сообщение о входе в BATTERY_ERROR_PROC.
+						 */
+						(void)RadioLine_SendPacket(73U, NULL, 0U);
+				}
+				else if (logger->state == REQ_BDBG)
+				{
+						/*
+						 * Сообщение о входе в REQ_BDBG.
+						 */
+						(void)RadioLine_SendPacket(74U, NULL, 0U);
+				}
+				else if (logger->state == BDBG_PROC)
+				{
+						/*
+						 * Сообщение о входе в BDBG_PROC.
+						 */
+						(void)RadioLine_SendPacket(75U, NULL, 0U);
+				}
+				else if (logger->state == BDBG_ERROR_PROC)
+				{
+						/*
+						 * Сообщение о входе в BDBG_ERROR_PROC.
+						 */
+						(void)RadioLine_SendPacket(76U, NULL, 0U);
+				}
+				else if (logger->state == REQ_LIDAR)
+				{
+						/*
+						 * Сообщение о входе в REQ_LIDAR.
+						 */
+						(void)RadioLine_SendPacket(77U, NULL, 0U);
+				}
+				else if (logger->state == LIDAR_PROC)
+				{
+						/*
+						 * Сообщение о входе в LIDAR_PROC.
+						 */
+						(void)RadioLine_SendPacket(78U, NULL, 0U);
+				}
+				else if (logger->state == LIDAR_ERROR_PROC)
+				{
+						/*
+						 * Сообщение о входе в LIDAR_ERROR_PROC.
+						 */
+						(void)RadioLine_SendPacket(79U, NULL, 0U);
+				}
+				else if (logger->state == WORK_SD)
+				{
+						/*
+						 * Сообщение о входе в WORK_SD.
+						 */
+						(void)RadioLine_SendPacket(83U, NULL, 0U);
+				}
 				
 				
 				else if (logger->state == FLIGHT_CHANGE)
@@ -2917,6 +2989,7 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 				
 		}
 		#endif
+		
 		
 		/*
 		 * Сначала проверяем асинхронное событие таймера контроля
@@ -4151,8 +4224,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 						break;
 				}
+				
 
-       /* Неблокирующая обработка поступивших NMEA-предложений. */
+        /* Неблокирующая обработка поступивших NMEA-предложений. */
        case GPS_PROC:
 			 {
 					GPS_Fix fix;
@@ -4724,6 +4798,69 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						if (logger->req_mode == MODE_WORK)
 						{
 								/*
+								 * ============================================================
+								 * ВЫХОД ИЗ ОБЛАСТИ РАЗВЕДКИ
+								 * ============================================================
+								 *
+								 * Проверяется для режимов измерений
+								 * (MODE_OPERATOR, MODE_TIME, MODE_DISTANCE)
+								 * и подготовки спектра (START_SPECTRE).
+								 *
+								 * Вне области:
+								 *   - ID19 по RadioLine и на SD (как в MODE_EXPECT);
+								 *   - измерение не выполняется;
+								 *   - запуск спектра отменяется (как ID08
+								 *     при START_SPECTRE): повторы сбрасываются,
+								 *     прежний режим восстанавливается;
+								 *   - переход в COMMAND_INFO.
+								 *
+								 * Признак ручного измерения (ID10)
+								 * сбрасывается в COMMAND_INFO.
+								 */
+								if (((logger->work_mode == MODE_OPERATOR) ||
+										 (logger->work_mode == MODE_TIME) ||
+										 (logger->work_mode == MODE_DISTANCE) ||
+										 (logger->work_mode == START_SPECTRE)) &&
+										(LoggerStateMachine_IsPointInsideArea(
+												logger->gps_data.current_coord,
+												&logger->flight_config) == 0U))
+								{
+										/*
+										 * ID19 — координаты GPS и время, вне области.
+										 */
+										(void)RadioLine_SendPacket(
+												19U,
+												gps_payload,
+												sizeof(gps_payload)
+										);
+
+										(void)SD_Logger_WritePacket(
+												19U,
+												gps_payload,
+												(uint16_t)sizeof(gps_payload)
+										);
+
+										/*
+										 * Подготовка спектра вне области:
+										 * прибор набор ещё не начал.
+										 * Отменяем повторы и возвращаем режим.
+										 */
+										if (logger->work_mode == START_SPECTRE)
+										{
+												logger->bdbg_start_retry_pending = 0U;
+												logger->bdbg_start_retry_tick = 0U;
+												logger->spectrum_prepare_retry = 0U;
+
+												logger->work_mode = logger->old_work_mode;
+												logger->bdbg_request = PAED_REQ;
+										}
+
+										logger->dev_type = DEV_NONE;
+										logger->state = COMMAND_INFO;
+										break;
+								}
+
+								/*
 								 * START_SPECTRE — подготовка набора спектра.
 								 *
 								 * После получения достоверных GPS-данных
@@ -4831,11 +4968,12 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 								logger->state = COMMAND_INFO;
 								break;
 						}
-			
+		
 
-					  break;   
-			  } 				
-				
+						break;   
+		    } 				
+
+			
 				
 				case GPS_ERROR_PROC:
 				{
