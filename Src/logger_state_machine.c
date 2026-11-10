@@ -1862,6 +1862,17 @@ static uint8_t LoggerStateMachine_ProcessRtcInterval(
     }
 
     /*
+     * Ожидается смена территории.
+     *
+     * Новый цикл измерений по старой
+     * территории не запускаем.
+     */
+    if (logger->new_flight_config_pending != 0U)
+    {
+        return 0U;
+    }
+
+    /*
      * Интервалы ожидания контролируются только в COMMAND_INFO.
      *
      * Во время опроса GPS и остальных приборов
@@ -2963,17 +2974,9 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
          * ============================================================
          */ 
 				 
-				 
-				 
-				 
-				 
-				 
-				 
-				 
-				 
-				 
+			 
 			
-								case COMMAND_INFO:
+				case COMMAND_INFO:
 				{
 						/*
 						 * Признак ручного измерения (ID10) действует только
@@ -2984,6 +2987,19 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						 * поэтому признак сбрасывается здесь.
 						 */
 						operator_measure_request = 0U;
+
+						/*
+						 * Смена территории не завершена.
+						 *
+						 * Команды RadioLine не разбираем: com_info
+						 * и буфер приёма остаются без изменений,
+						 * команды будут обработаны после смены.
+						 */
+						if (logger->new_flight_config_pending != 0U)
+						{
+								logger->state = FLIGHT_CHANGE;
+								break;
+						}
 
 						/*
 						 * Ожидаем завершения приёма RadioLine.
@@ -3637,10 +3653,25 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 										(void)RadioLine_SendPacket(0x01U, NULL, 0U);
 
 										/*
-										 * Заменяем действующую конфигурацию
-										 * одним присваиванием структуры.
+										 * Новая конфигурация не применяется сразу.
+										 *
+										 * Она сохраняется отдельно и будет применена
+										 * в FLIGHT_CHANGE после завершения работы
+										 * с предыдущей территорией.
+										 *
+										 * Признак ставится только после полной
+										 * проверки параметров.
 										 */
-										logger->flight_config = new_config;
+										logger->pending_flight_config = new_config;
+										logger->new_flight_config_pending = 1U;
+
+										/*
+										 * Интервальные измерения по старой
+										 * территории больше не запускаются.
+										 */
+										LoggerStateMachine_StopInterval(logger);
+
+										logger->state = FLIGHT_CHANGE;
 										break;
 								}
 
@@ -4046,25 +4077,7 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 				}
 				
 				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-				
-								 
+		 
 
         /*
          * ============================================================
