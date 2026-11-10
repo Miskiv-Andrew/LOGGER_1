@@ -18,6 +18,7 @@ void BDBG_StopReceive(void)
     if (active_uart != NULL) (void)HAL_UART_AbortReceive(active_uart);
     active_uart = NULL;
 }
+
 uint8_t BDBG_StartRequest(UART_HandleTypeDef *uart, BdbgRequest command)
 {
     uint8_t tx[BDBG_REQUEST_MAX_SIZE];
@@ -25,6 +26,14 @@ uint8_t BDBG_StartRequest(UART_HandleTypeDef *uart, BdbgRequest command)
     if (uart == NULL) return 0U;
     if (!BDBG_ProtocolBuildRequest(BDBG_DEFAULT_ADDRESS, command, tx, &tx_length)) return 0U;
     BDBG_StopReceive();
+    /*
+     * Ответ на предыдущий запрос мог прийти при выключенном приёме
+     * (PAED_REQ при смене территории закрывается без ожидания ответа).
+     * Сбрасываем флаги ошибок UART (ORE, NE, PE, FE) и очищаем приёмник,
+     * иначе первый запрос на новой территории будет сорван.
+     */
+    __HAL_UART_CLEAR_FLAG(uart, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_PEF | UART_CLEAR_FEF);
+    __HAL_UART_SEND_REQ(uart, UART_RXDATA_FLUSH_REQUEST);
     rx_expected = ((command == START_SPECTRE_REQ) || (command == GET_SPECTRE_REQ))
                     ? BDBG_SPECTRUM_RESPONSE_SIZE : ((command == PAED_REQ) ? 12U : 8U);
     rx_status = BDBG_RX_WAIT;
@@ -36,6 +45,7 @@ uint8_t BDBG_StartRequest(UART_HandleTypeDef *uart, BdbgRequest command)
     { BDBG_StopReceive(); rx_status = BDBG_RX_UART_ERROR; return 0U; }
     return 1U;
 }
+
 BDBG_RxStatus BDBG_GetRxStatus(void) { return rx_status; }
 void BDBG_RxCompleteCallback(UART_HandleTypeDef *uart)
 { if ((uart == active_uart) && (rx_status == BDBG_RX_WAIT)) rx_status = BDBG_RX_READY; }

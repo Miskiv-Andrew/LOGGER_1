@@ -522,8 +522,14 @@ SD_LoggerResult SD_Logger_OpenFlight(
      * Полный путь:
      *
      * 0:/YYMMDD/HHMMSS.CSV
+     *
+     * При совпадении имени:
+     *
+     * 0:/YYMMDD/HHMMSSNN.CSV
+     *
+     * Размер рассчитан на имя с суффиксом.
      */
-    char filename[21] = "0:/000000/000000.CSV";
+    char filename[23] = "0:/000000/000000.CSV";
 
     FRESULT result;
 
@@ -680,12 +686,47 @@ SD_LoggerResult SD_Logger_OpenFlight(
     );
 
     /*
+     * Файл с таким именем уже существует.
+     *
+     * Возможные причины:
+     * - два ID04 подряд в пределах одной секунды;
+     * - RTC не синхронизирован.
+     *
+     * Пробуем имена HHMMSSNN.CSV, NN = 01...99.
+     * Имя в формате 8.3, LFN не требуется.
+     *
+     * Существующие файлы не изменяются,
+     * запись на SD не отключается.
+     */
+    for (uint8_t suffix = 1U;
+         (result == FR_EXIST) && (suffix <= 99U);
+         suffix++)
+    {
+        SD_Logger_WriteTwoDigits(
+            &filename[16], suffix
+        );
+
+        filename[18] = '.';
+        filename[19] = 'C';
+        filename[20] = 'S';
+        filename[21] = 'V';
+        filename[22] = '\0';
+
+        result = f_open(
+            &sd_file,
+            filename,
+            FA_WRITE | FA_CREATE_NEW
+        );
+    }
+
+    /*
      * Проверяем результат создания файла.
      */
     if (result != FR_OK)
     {
         /*
-         * В том числе обрабатываем FR_EXIST.
+         * В том числе FR_EXIST, если заняты
+         * все 99 имён с суффиксом.
          *
          * Регистрируем ошибку SD.
          * Запись будет отключена.

@@ -6870,15 +6870,10 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 						logger->state = COMMAND_INFO;
 
 						break;
-				}
-				
-				
-				
-				
-				
+				}			
 
 				
-								case WORK_SD:
+				case WORK_SD:
 				{
 						/*
 						 * ========================================================
@@ -7183,7 +7178,175 @@ void LoggerStateMachine_Process(LoggerStateMachine *logger)
 
 						break;
 				}
-			
+				
+				
+				/*
+				 * ============================================================
+				 * FLIGHT_CHANGE — СМЕНА ТЕРРИТОРИИ РАЗВЕДКИ
+				 * ============================================================
+				 *
+				 * Вход только из COMMAND_INFO после принятого ID04
+				 * (new_flight_config_pending = 1).
+				 *
+				 * Выполняется за один проход:
+				 *   1. Прекращение работы по старой территории.
+				 *   2. Сохранение накопленного спектра.
+				 *   3. Остановка БДБГ (PAED_REQ без ожидания ответа).
+				 *   4. Закрытие CSV старой территории.
+				 *   5. Применение pending_flight_config.
+				 *   6. Сброс данных старой территории.
+				 *   7. Открытие CSV новой территории.
+				 *   8. MODE_EXPECT → COMMAND_INFO.
+				 *
+				 * Команды RadioLine, пришедшие во время смены,
+				 * остаются в буфере и обрабатываются в COMMAND_INFO
+				 * после смены.
+				 * ============================================================
+				 */
+				case FLIGHT_CHANGE:
+				{
+						/*
+						 * В COMMAND_INFO прибор не опрашивается.
+						 * Останавливаем TIM3 и сбрасываем возможное
+						 * старое событие таймаута.
+						 */
+						(void)HAL_TIM_Base_Stop_IT(&htim3);
+						device_timeout = 0U;
+						logger->dev_type = DEV_NONE;
+
+						/*
+						 * ========================================================
+						 * 1. НОВЫЕ ИЗМЕРЕНИЯ ПО СТАРОЙ ТЕРРИТОРИИ НЕ ЗАПУСКАЕМ
+						 * ========================================================
+						 *
+						 * Отменяем интервал, повтор START_SPECTRE_REQ
+						 * и повтор подготовки спектра.
+						 */
+						LoggerStateMachine_StopInterval(logger);
+
+						logger->bdbg_start_retry_pending = 0U;
+						logger->bdbg_start_retry_tick = 0U;
+						logger->spectrum_prepare_retry = 0U;
+
+						/*
+						 * ID08 во время спектра больше не действует:
+						 * после смены LOGGER переходит в MODE_EXPECT.
+						 */
+						return_after_spectrum = 0U;
+
+						/*
+						 * ========================================================
+						 * 2. СОХРАНЕНИЕ НАКОПЛЕННОГО СПЕКТРА
+						 * ========================================================
+						 *
+						 * Запись ID23 выполняется только при
+						 * spectrum_start_data_valid = 1
+						 * (проверка внутри функции).
+						 */
+						if (logger->bdbg_spectrum_active != 0U)
+						{
+								(void)SD_WriteAccumulatedSpectrum(logger);
+						}
+
+						/*
+						 * ========================================================
+						 * 3. ОСТАНОВКА БДБГ
+						 * ========================================================
+						 *
+						 * PAED_REQ останавливает набор спектра.
+						 * Отправляется, если прибор мог начать набор:
+						 * идёт набор или подготовка его запуска.
+						 *
+						 * BDBG_StartRequest() передаёт запрос блокирующим
+						 * HAL_UART_Transmit() с таймаутом 100 мс.
+						 *
+						 * Ответ не ожидаем: приём сразу закрываем.
+						 * Флаги ошибок UART4 сбрасываются в BDBG_StartRequest()
+						 * перед следующим запросом.
+						 */
+						if ((logger->bdbg_spectrum_active != 0U) ||
+								(logger->work_mode == START_SPECTRE) ||
+								(logger->work_mode == MODE_SPECTRE))
+						{
+								(void)BDBG_StartRequest(&huart4, PAED_REQ);
+								BDBG_StopReceive();
+						}
+
+						/*
+						 * ========================================================
+						 * 4. ЗАКРЫТИЕ CSV СТАРОЙ ТЕРРИТОРИИ
+						 * ========================================================
+						 *
+						 * Ошибку закрытия регистрирует sd_logger (ID16).
+						 */
+						if ((SD_Logger_IsFileOpen() != 0U) &&
+								(SD_Logger_IsEnabled() != 0U))
+						{
+								(void)SD_Logger_Close();
+						}
+
+						/*
+						 * ========================================================
+						 * 5. ПРИМЕНЕНИЕ НОВОЙ КОНФИГУРАЦИИ
+						 * ========================================================
+						 */
+						logger->flight_config = logger->pending_flight_config;
+
+						repeat_factor = logger->flight_config.duplCoeff;
+
+						logger->work_mode =
+								(DroneWorkMode)logger->flight_config.mode;
+						logger->old_work_mode = logger->work_mode;
+
+						/*
+						 * ========================================================
+						 * 6. СБРОС ДАННЫХ СТАРОЙ ТЕРРИТОРИИ
+						 * ========================================================
+						 *
+						 * Не сбрасываются: last_valid_coord,
+						 * last_valid_rtc_time, gps_spoofing_counter,
+						 * счётчики ошибок приборов,
+						 * spectrum_sequence_number, write_radioline_flag.
+						 */
+						logger->gps_data.has_last_saved_coord = 0U;
+						logger->has_last_saved_lidar_height = 0U;
+						logger->gps_data.distance_from_saved_m = 0.0f;
+
+						logger->bdbg_spectrum_active = 0U;
+						logger->bdbg_spectrum_stopping = 0U;
+						logger->bdbg_spectrum_error_shutdown = 0U;
+
+						logger->spectrum_start_data_valid = 0U;
+
+						logger->bdbg_request = PAED_REQ;
+
+						operator_measure_request = 0U;
+
+						/*
+						 * ========================================================
+						 * 7. ОТКРЫТИЕ CSV НОВОЙ ТЕРРИТОРИИ
+						 * ========================================================
+						 *
+						 * При отключённой SD файл не создаётся.
+						 * Ошибка SD не прерывает смену территории.
+						 */
+						SD_OpenFlightFile(logger);
+
+						/*
+						 * ========================================================
+						 * 8. ЗАВЕРШЕНИЕ СМЕНЫ
+						 * ========================================================
+						 *
+						 * Признак сбрасывается последним:
+						 * конфигурация применена один раз.
+						 */
+						logger->new_flight_config_pending = 0U;
+
+						logger->req_mode = MODE_EXPECT;
+						logger->state = COMMAND_INFO;
+
+						break;
+				}		
 				
 				
         /*
