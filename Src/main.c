@@ -275,6 +275,14 @@ static void MX_TIM3_Init(void);
 #include <stdint.h>
 
 
+
+
+
+
+
+
+
+
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     /*
@@ -480,7 +488,27 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         return;
     }
 
+    /* UART4: событие приёма ответа БДБГ (IDLE или заполнение буфера). */
+    if (huart->Instance == UART4)
+    {
+        BDBG_RxEventCallback(huart, Size);
+        return;
+    }
+
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 /* Ошибки GPS USART3 сигнализируем стейт-машине без блокировки в ISR. */
@@ -1707,13 +1735,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
          * и установит флаг готовности lidar_info.
          */
         LIDAR_RxCpltCallback();
-        return;
-    }
-
-    /* UART4: завершён приём ответа БДБГ-15 через DMA. */
-    if (huart->Instance == UART4)
-    {
-        BDBG_RxCompleteCallback(huart);
         return;
     }
 }
