@@ -8,7 +8,7 @@
 #define LIDAR_RX_SIZE             45U
 #define LIDAR_FRAME_SIZE           9U
 #define LIDAR_MIN_DISTANCE_CM    100U
-#define LIDAR_MAX_DISTANCE_CM   5000U
+#define LIDAR_MAX_DISTANCE_CM  60000U
 #define LIDAR_MIN_STRENGTH       100U
 
 /*
